@@ -511,7 +511,7 @@ ${textToAnalyze}
           : userPrompt;
 
         const response = await ai.models.generateContent({
-          model: "gemini-3.7-flash",
+          model: "gemini-3.6-flash",
           contents: genContents as any,
           config: {
             systemInstruction: systemInstruction,
