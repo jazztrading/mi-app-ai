@@ -20,7 +20,6 @@ import {
   Video, 
   Mic, 
   Award,
-  BookMarked,
   Layers,
   HelpCircle,
   Calendar,
@@ -125,9 +124,6 @@ export default function App() {
   const [analyses, setAnalyses] = useState<AnalysisResult[]>([]);
   const [selectedAnalysis, setSelectedAnalysis] = useState<AnalysisResult | null>(null);
   const [error, setError] = useState<string | null>(null);
-
-  // Suggested quick-start demo URL from the prompt
-  const demoUrl = "https://www.conspicuouscognition.com/p/how-tribes-construct-rival-realities";
 
   // Fetch past analyses on load & sync with localStorage
   useEffect(() => {
@@ -349,13 +345,6 @@ export default function App() {
     }
   };
 
-  const handleQuickDemo = () => {
-    setUrl(demoUrl);
-    setContentType("blog");
-    setActiveTab("url");
-    startAnalysis(demoUrl);
-  };
-
   // Helper to get score color
   const getScoreColor = (score: number) => {
     if (score >= 80) return "text-emerald-600 bg-emerald-50 border-emerald-200";
@@ -408,30 +397,6 @@ export default function App() {
 
       <main className="max-w-7xl mx-auto px-4 py-8 sm:px-6 lg:px-8">
         
-        {/* Quick Demo Recommender Banner */}
-        <div className="mb-8 p-4 bg-white border border-slate-200 rounded-xl shadow-xs flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
-          <div className="flex items-start gap-3">
-            <div className="p-2 bg-indigo-50 text-indigo-600 rounded-lg shrink-0 mt-0.5">
-              <Sparkles className="w-5 h-5" />
-            </div>
-            <div>
-              <h3 className="font-display font-semibold text-slate-900">¿Listo para comenzar las pruebas de rigor?</h3>
-              <p className="text-sm text-slate-600 max-w-2xl mt-0.5">
-                El usuario solicitó probar en primer lugar el ensayo de Substack: 
-                <span className="font-mono text-xs text-slate-800 bg-slate-100 px-1 py-0.5 rounded mx-1 break-all">conspicuouscognition.com/p/how-tribes-construct-rival-realities</span>.
-              </p>
-            </div>
-          </div>
-          <button
-            onClick={handleQuickDemo}
-            disabled={loading}
-            className="w-full md:w-auto px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-medium text-sm transition-all duration-200 flex items-center justify-center gap-2 shrink-0 disabled:opacity-50 cursor-pointer shadow-sm hover:shadow-md"
-          >
-            <BookMarked className="w-4 h-4" />
-            Probar Substack Sugerido
-          </button>
-        </div>
-
         {/* Outer Bento Grid */}
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
           
