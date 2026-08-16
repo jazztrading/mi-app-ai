@@ -31,7 +31,11 @@ import {
   ImageIcon,
   Calculator,
   TrendingUp,
-  Coins
+  Coins,
+  Copy,
+  Check,
+  Download,
+  Lightbulb
 } from "lucide-react";
 import {
   BarChart,
@@ -44,6 +48,18 @@ import {
   Cell
 } from "recharts";
 
+interface VerifiedScholarlyCitation {
+  title: string;
+  author: string;
+  year?: string;
+  doi?: string;
+  journalOrVenue?: string;
+  citationsCount?: number;
+  openAccessUrl?: string;
+  isVerified?: boolean;
+  link: string;
+}
+
 interface BibliographicSource {
   title: string;
   author: string;
@@ -54,12 +70,18 @@ interface BibliographicSource {
   criticalAnalysis: string;
   reliabilityScore: number;
   academicRigor: string;
+  doi?: string;
+  journalOrVenue?: string;
+  isVerified?: boolean;
+  citationsCount?: number;
+  openAccessUrl?: string;
 }
 
 interface CriticalPosition {
   title: string;
   argument: string;
   scientificBasis: string;
+  supportingStudy?: VerifiedScholarlyCitation;
 }
 
 interface ConstructiveDebatesSummary {
@@ -71,6 +93,8 @@ interface ConstructiveDebatesSummary {
 interface GlossaryTerm {
   term: string;
   definition: string;
+  simpleExample?: string;
+  scientificEvidenceOrSource?: string;
   referenceUrl: string;
 }
 
@@ -121,9 +145,34 @@ export default function App() {
   const [viewingPhoto, setViewingPhoto] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [loadingStep, setLoadingStep] = useState("");
-  const [analyses, setAnalyses] = useState<AnalysisResult[]>([]);
-  const [selectedAnalysis, setSelectedAnalysis] = useState<AnalysisResult | null>(null);
+  
+  // Eagerly initialize analyses and selectedAnalysis from localStorage for instant rendering
+  const [analyses, setAnalyses] = useState<AnalysisResult[]>(() => {
+    try {
+      const saved = localStorage.getItem("lupa_critica_history");
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) return parsed;
+      }
+    } catch {}
+    return [];
+  });
+  
+  const [selectedAnalysis, setSelectedAnalysis] = useState<AnalysisResult | null>(() => {
+    try {
+      const saved = localStorage.getItem("lupa_critica_history");
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed[0];
+      }
+    } catch {}
+    return null;
+  });
+
   const [error, setError] = useState<string | null>(null);
+  const [copiedNotion, setCopiedNotion] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<{ id: string; title: string } | null>(null);
+  const [showClearAllModal, setShowClearAllModal] = useState(false);
 
   // Fetch past analyses on load & sync with localStorage
   useEffect(() => {
@@ -134,9 +183,9 @@ export default function App() {
     try {
       const res = await fetch("/api/analyses");
       if (res.ok) {
-        const data: AnalysisResult[] = await res.json();
+        const serverData: AnalysisResult[] = await res.json();
         
-        // Merge with localStorage if available for extra durability
+        // Merge with localStorage
         let localData: AnalysisResult[] = [];
         try {
           const saved = localStorage.getItem("lupa_critica_history");
@@ -145,10 +194,9 @@ export default function App() {
           // ignore
         }
 
-        // Combine unique analyses by ID
         const map = new Map<string, AnalysisResult>();
-        data.forEach(item => map.set(item.id, item));
-        localData.forEach(item => {
+        serverData.forEach((item) => map.set(item.id, item));
+        localData.forEach((item) => {
           if (!map.has(item.id)) map.set(item.id, item);
         });
 
@@ -158,23 +206,16 @@ export default function App() {
           localStorage.setItem("lupa_critica_history", JSON.stringify(combined));
         } catch {}
 
-        if (combined.length > 0 && !selectedAnalysis) {
-          setSelectedAnalysis(combined[0]);
-        }
+        setSelectedAnalysis((current) => {
+          if (!current && combined.length > 0) return combined[0];
+          if (current && !combined.some((item) => item.id === current.id)) {
+            return combined.length > 0 ? combined[0] : null;
+          }
+          return current;
+        });
       }
     } catch (err) {
       console.error("Error al cargar históricos desde el servidor:", err);
-      // Fallback to localStorage
-      try {
-        const saved = localStorage.getItem("lupa_critica_history");
-        if (saved) {
-          const localData: AnalysisResult[] = JSON.parse(saved);
-          setAnalyses(localData);
-          if (localData.length > 0 && !selectedAnalysis) {
-            setSelectedAnalysis(localData[0]);
-          }
-        }
-      } catch {}
     }
   };
 
@@ -240,20 +281,23 @@ export default function App() {
       "Analizando el contenido del informe e identificando el idioma...",
       "Traduciendo y adaptando conceptos clave al castellano...",
       "Generando resumen ejecutivo y posiciones críticas universitarias...",
-      "Buscando fuentes bibliográficas de contraste en Scholar (2021-2026)..."
+      "Contrastando fuentes en registros de revisión por pares (OpenAlex, Crossref)...",
+      "Verificando citas indexadas en Google Scholar y repositorios académicos..."
     ] : isPhotoTab ? [
       "Iniciando escaneo visual y motor OCR en la fotografía...",
       "Extrayendo titulares, columnas y gráficos del recorte de prensa...",
       "Analizando el contenido de la imagen e identificando el idioma...",
       "Traduciendo y adaptando conceptos clave al castellano...",
       "Generando resumen ejecutivo y posiciones críticas universitarias...",
-      "Buscando fuentes bibliográficas de contraste (2021-2026)..."
+      "Contrastando fuentes en registros de revisión por pares (OpenAlex, Crossref)...",
+      "Verificando citas indexadas en Google Scholar y repositorios académicos..."
     ] : [
       "Iniciando raspado y extracción de datos del recurso...",
       "Analizando la estructura y el idioma del contenido original...",
       "Traduciendo y adaptando conceptos clave al castellano...",
       "Generando resumen ejecutivo y destilando puntos clave...",
-      "Buscando fuentes bibliográficas, ensayos y papers complementarios...",
+      "Contrastando fuentes en registros de revisión por pares (OpenAlex, Crossref)...",
+      "Verificando citas indexadas en Google Scholar y repositorios académicos...",
       "Evaluando el rigor académico y calculando índices de credibilidad..."
     ];
 
@@ -322,26 +366,47 @@ export default function App() {
     }
   };
 
-  const deleteAnalysis = async (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (!confirm("¿Seguro que deseas eliminar este análisis del histórico?")) return;
+  const requestDeleteAnalysis = (id: string, title: string, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    setDeleteTarget({ id, title });
+  };
+
+  const executeDelete = async (id: string) => {
+    // Optimistic removal from state and local storage
+    setAnalyses((prev) => {
+      const updated = prev.filter((item) => item.id !== id);
+      try {
+        localStorage.setItem("lupa_critica_history", JSON.stringify(updated));
+      } catch {}
+      return updated;
+    });
+
+    setSelectedAnalysis((current) => {
+      if (current?.id === id) {
+        const remaining = analyses.filter((item) => item.id !== id);
+        return remaining.length > 0 ? remaining[0] : null;
+      }
+      return current;
+    });
+
+    setDeleteTarget(null);
 
     try {
-      const res = await fetch(`/api/analyses/${id}`, { method: "DELETE" });
-      if (res.ok) {
-        setAnalyses(prev => {
-          const updated = prev.filter(item => item.id !== id);
-          try {
-            localStorage.setItem("lupa_critica_history", JSON.stringify(updated));
-          } catch {}
-          return updated;
-        });
-        if (selectedAnalysis?.id === id) {
-          setSelectedAnalysis(null);
-        }
-      }
+      await fetch(`/api/analyses/${id}`, { method: "DELETE" });
     } catch (err) {
-      console.error("Error al eliminar:", err);
+      console.error("Error al sincronizar borrado con el servidor:", err);
+    }
+  };
+
+  const executeClearAll = async () => {
+    setAnalyses([]);
+    setSelectedAnalysis(null);
+    setShowClearAllModal(false);
+    try {
+      localStorage.removeItem("lupa_critica_history");
+      await fetch("/api/analyses", { method: "DELETE" });
+    } catch (err) {
+      console.error("Error al vaciar histórico:", err);
     }
   };
 
@@ -369,27 +434,231 @@ export default function App() {
     }
   };
 
+  const sanitizeFilename = (title: string): string => {
+    return (
+      title
+        .toLowerCase()
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 60) || "analisis-lupa-critica"
+    );
+  };
+
+  const generateNotionMarkdown = (analysis: AnalysisResult): string => {
+    let md = `# ${analysis.title}\n\n`;
+
+    // Metadata section
+    md += `> **Metadatos del Análisis**\n`;
+    if (analysis.url) {
+      md += `> - **Recurso Original:** [${analysis.url}](${analysis.url})\n`;
+    }
+    md += `> - **Tipo de Contenido:** ${analysis.contentType}\n`;
+    if (analysis.categories && analysis.categories.length > 0) {
+      md += `> - **Categorías:** ${analysis.categories.join(", ")}\n`;
+    }
+    md += `> - **Idioma Original:** ${analysis.originalLanguage}\n`;
+    if (analysis.analyzedAt) {
+      md += `> - **Fecha de Análisis:** ${new Date(analysis.analyzedAt).toLocaleString("es-ES")}\n`;
+    }
+    if (analysis.fileNames && analysis.fileNames.length > 0) {
+      md += `> - **Archivos Analizados:** ${analysis.fileNames.join(", ")}\n`;
+    }
+    md += `\n---\n\n`;
+
+    // 1. Resumen Ejecutivo
+    md += `## Resumen Ejecutivo\n\n${analysis.executiveSummary.trim()}\n\n`;
+
+    // 2. Puntos Clave
+    if (analysis.keyPoints && analysis.keyPoints.length > 0) {
+      md += `## Puntos Clave\n\n`;
+      analysis.keyPoints.forEach((point, i) => {
+        md += `- **Punto ${i + 1}:** ${point}\n`;
+      });
+      md += `\n`;
+    }
+
+    // 3. Ejemplos Numéricos, Costes y Cifras Reales
+    if (analysis.numericalExamples && analysis.numericalExamples.length > 0) {
+      md += `## Ejemplos Numéricos, Costes y Cifras Reales\n\n`;
+      analysis.numericalExamples.forEach((item) => {
+        md += `### ${item.concept} — \`${item.figureOrCost}\`\n\n`;
+        md += `${item.explanation}\n\n`;
+      });
+    }
+
+    // 4. Posiciones Críticas Científica y Metodológicamente Fundamentadas
+    if (analysis.criticalPositions && analysis.criticalPositions.length > 0) {
+      md += `## Posiciones Críticas Científica y Metodológicamente Fundamentadas\n\n`;
+      analysis.criticalPositions.forEach((crit, i) => {
+        md += `### Posición ${i + 1}: ${crit.title}\n\n`;
+        md += `- **Argumento:** ${crit.argument}\n`;
+        md += `- **Fundamento Científico/Empírico:** ${crit.scientificBasis}\n`;
+        if (crit.supportingStudy) {
+          md += `- **Estudio Empírico Contrastado (Peer-Reviewed):** _${crit.supportingStudy.title}_ — ${crit.supportingStudy.author}${crit.supportingStudy.year ? ` (${crit.supportingStudy.year})` : ""}\n`;
+          if (crit.supportingStudy.journalOrVenue) md += `  - **Revista / Editorial:** ${crit.supportingStudy.journalOrVenue}\n`;
+          if (crit.supportingStudy.doi) md += `  - **DOI Oficial:** [${crit.supportingStudy.doi}](${crit.supportingStudy.doi})\n`;
+          if (crit.supportingStudy.citationsCount) md += `  - **Citas Registradas:** ${crit.supportingStudy.citationsCount}\n`;
+          if (crit.supportingStudy.link) md += `  - **Google Scholar:** [Consultar en Google Scholar](${crit.supportingStudy.link})\n`;
+        }
+        md += `\n`;
+      });
+    }
+
+    // 5. Debates Constructivos en Curso y Consensos
+    if (analysis.constructiveDebatesSummary) {
+      md += `## Debates Constructivos en Curso y Consensos\n\n`;
+      if (analysis.constructiveDebatesSummary.overview) {
+        md += `### Estado General de la Discusión\n\n${analysis.constructiveDebatesSummary.overview}\n\n`;
+      }
+      if (analysis.constructiveDebatesSummary.consensusAndDisagreements) {
+        md += `### Consensos y Puntos de Desacuerdo Lógico\n\n${analysis.constructiveDebatesSummary.consensusAndDisagreements}\n\n`;
+      }
+      if (analysis.constructiveDebatesSummary.keyQuestions && analysis.constructiveDebatesSummary.keyQuestions.length > 0) {
+        md += `### Preguntas Abiertas y Dilemas Clave\n\n`;
+        analysis.constructiveDebatesSummary.keyQuestions.forEach((q) => {
+          md += `- ${q}\n`;
+        });
+        md += `\n`;
+      }
+    }
+
+    // 6. Debates Académicos e Intelectuales
+    if (analysis.academicDebates) {
+      md += `## Debates Académicos e Intelectuales\n\n${analysis.academicDebates.trim()}\n\n`;
+    }
+
+    // 7. Glosario Didáctico de Conceptos Complejos
+    if (analysis.glossary && analysis.glossary.length > 0) {
+      md += `## Glosario Didáctico de Conceptos Complejos\n\n`;
+      analysis.glossary.forEach((term, idx) => {
+        md += `### ${idx + 1}. ${term.term}\n\n`;
+        md += `- **Definición:** ${term.definition}\n`;
+        if (term.simpleExample) {
+          md += `- **Ejemplo Sencillo e Intuitivo:** ${term.simpleExample}\n`;
+        }
+        if (term.scientificEvidenceOrSource) {
+          md += `- **Evidencia Científica y Fuente Probada:** ${term.scientificEvidenceOrSource}\n`;
+        }
+        if (term.referenceUrl) {
+          md += `- **Referencia Académica:** [Consultar en Repositorio Oficial](${term.referenceUrl})\n`;
+        }
+        md += `\n`;
+      });
+    }
+
+    // 8. Transcripción y Traducción Exhaustiva al Castellano (si aplica)
+    if (analysis.translation) {
+      md += `## Transcripción y Traducción Exhaustiva al Castellano\n\n${analysis.translation.trim()}\n\n`;
+    }
+
+    // 9. Fuentes Bibliográficas e Investigación Secundaria Verificada
+    if (analysis.bibliographicSources && analysis.bibliographicSources.length > 0) {
+      md += `## Fuentes Bibliográficas e Investigación Secundaria Verificada\n\n`;
+      analysis.bibliographicSources.forEach((src, idx) => {
+        md += `### ${idx + 1}. ${src.title}\n\n`;
+        md += `- **Autor/es:** ${src.author}\n`;
+        if (src.year) md += `- **Año:** ${src.year}\n`;
+        if (src.journalOrVenue) md += `- **Revista / Editorial:** ${src.journalOrVenue}\n`;
+        if (src.doi) md += `- **DOI:** [${src.doi}](${src.doi})\n`;
+        md += `- **Tipo:** ${src.type}\n`;
+        if (src.citationsCount !== undefined && src.citationsCount !== null) md += `- **Citas Registradas:** ${src.citationsCount}\n`;
+        md += `- **Fiabilidad Metodológica:** ${src.reliabilityScore}/100\n`;
+        md += `- **Rigor Académico:** ${src.academicRigor}\n`;
+        if (src.link) md += `- **Búsqueda Google Scholar:** [Ver en Google Scholar](${src.link})\n`;
+        md += `\n**Sinopsis y Contribución:**\n${src.summary}\n\n`;
+        md += `**Análisis Crítico y Contraste:**\n_${src.criticalAnalysis}_\n\n`;
+      });
+    }
+
+    return md;
+  };
+
+  const handleCopyNotion = async (target?: AnalysisResult) => {
+    const analysisToUse = target || selectedAnalysis;
+    if (!analysisToUse) return;
+    const md = generateNotionMarkdown(analysisToUse);
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(md);
+      } else {
+        const textArea = document.createElement("textarea");
+        textArea.value = md;
+        document.body.appendChild(textArea);
+        textArea.select();
+        document.execCommand("copy");
+        document.body.removeChild(textArea);
+      }
+      setCopiedNotion(true);
+      setTimeout(() => setCopiedNotion(false), 2200);
+    } catch (err) {
+      console.error("Error al copiar al portapapeles:", err);
+    }
+  };
+
+  const handleDownloadMarkdown = (target?: AnalysisResult) => {
+    const analysisToUse = target || selectedAnalysis;
+    if (!analysisToUse) return;
+    const md = generateNotionMarkdown(analysisToUse);
+    const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
+    const downloadUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = downloadUrl;
+    a.download = `${sanitizeFilename(analysisToUse.title)}.md`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(downloadUrl);
+  };
+
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 font-sans selection:bg-slate-200">
       {/* Top Professional Header */}
       <header className="border-b border-slate-200 bg-white sticky top-0 z-50 shadow-xs">
-        <div className="max-w-7xl mx-auto px-4 py-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-4">
+        <div className="max-w-7xl mx-auto px-4 py-3 sm:px-6 lg:px-8 flex flex-col md:flex-row items-center justify-between gap-3">
           <div className="flex items-center gap-3">
             <div className="p-2.5 bg-slate-900 text-white rounded-lg shadow-sm">
-              <ShieldCheck className="w-6 h-6" />
+              <ShieldCheck className="w-5 h-5" />
             </div>
             <div>
-              <h1 className="text-xl font-display font-bold tracking-tight text-slate-900 flex items-center gap-2">
+              <h1 className="text-lg font-display font-bold tracking-tight text-slate-900 flex items-center gap-2">
                 Lupa Crítica <span className="text-xs font-mono font-medium px-2 py-0.5 bg-slate-100 text-slate-600 rounded-full border border-slate-200">Verificador Académico</span>
               </h1>
               <p className="text-xs text-slate-500">Deconstrucción, traducción y verificación de fuentes para blogs, podcasts y vídeos científicos o de divulgación.</p>
             </div>
           </div>
           
-          <div className="flex items-center gap-2">
-            <span className="text-xs font-mono text-slate-500 bg-slate-100 px-3 py-1.5 rounded-md border border-slate-200 flex items-center gap-1.5">
+          <div className="flex items-center gap-2.5">
+            {selectedAnalysis && (
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => handleCopyNotion()}
+                  className={`text-xs px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-all font-medium border shadow-xs cursor-pointer ${
+                    copiedNotion
+                      ? "bg-emerald-600 text-white border-emerald-700 shadow-sm"
+                      : "bg-white text-slate-800 border-slate-300 hover:bg-slate-50 hover:border-slate-400 hover:text-slate-900"
+                  }`}
+                  title="Copiar informe activo en formato Markdown para Notion"
+                >
+                  {copiedNotion ? <Check className="w-3.5 h-3.5 text-white" /> : <Copy className="w-3.5 h-3.5 text-indigo-600" />}
+                  <span>{copiedNotion ? "¡Copiado para Notion!" : "Copiar Notion"}</span>
+                </button>
+
+                <button
+                  onClick={() => handleDownloadMarkdown()}
+                  className="text-xs text-slate-800 bg-white border border-slate-300 hover:bg-slate-50 hover:border-slate-400 hover:text-slate-900 px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-all font-medium shadow-xs cursor-pointer"
+                  title="Descargar análisis como archivo .md para importar a Notion"
+                >
+                  <Download className="w-3.5 h-3.5 text-emerald-600" />
+                  <span>Descargar .md</span>
+                </button>
+              </div>
+            )}
+
+            <span className="text-xs font-mono text-slate-500 bg-slate-100 px-2.5 py-1.5 rounded-md border border-slate-200 flex items-center gap-1.5">
               <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-              Gabinete Activo
+              {analyses.length > 0 ? `${analyses.length} en Histórico` : "Gabinete Listo"}
             </span>
           </div>
         </div>
@@ -643,13 +912,24 @@ export default function App() {
 
             {/* History Panel */}
             <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs">
-              <h2 className="text-base font-display font-semibold text-slate-900 mb-3 flex items-center gap-2">
-                <Layers className="w-5 h-5 text-slate-700" />
-                Histórico de Análisis
-              </h2>
-              <p className="text-xs text-slate-500 mb-4">Selecciona cualquier recurso analizado para desplegar sus resultados académicos.</p>
+              <div className="flex items-center justify-between gap-2 mb-2">
+                <h2 className="text-base font-display font-semibold text-slate-900 flex items-center gap-2">
+                  <Layers className="w-5 h-5 text-slate-700" />
+                  Histórico de Análisis
+                </h2>
+                {analyses.length > 0 && (
+                  <button
+                    onClick={() => setShowClearAllModal(true)}
+                    className="text-[11px] text-slate-400 hover:text-rose-600 font-mono transition-colors cursor-pointer px-2 py-0.5 rounded hover:bg-rose-50"
+                    title="Vaciar todo el historial"
+                  >
+                    Vaciar todo
+                  </button>
+                )}
+              </div>
+              <p className="text-xs text-slate-500 mb-3.5">Selecciona cualquier recurso analizado para desplegar sus resultados académicos.</p>
 
-              <div className="space-y-3 max-h-[350px] overflow-y-auto pr-1">
+              <div className="space-y-2.5 max-h-[380px] overflow-y-auto pr-1">
                 {analyses.length === 0 ? (
                   <div className="py-6 text-center border-2 border-dashed border-slate-100 rounded-lg text-slate-400">
                     <BookOpen className="w-8 h-8 mx-auto mb-2 opacity-50" />
@@ -660,38 +940,66 @@ export default function App() {
                     <div
                       key={item.id}
                       onClick={() => setSelectedAnalysis(item)}
-                      className={`p-3 rounded-lg border transition-all cursor-pointer relative group flex items-start justify-between gap-2 ${
+                      className={`p-3 rounded-lg border transition-all cursor-pointer flex flex-col gap-2 ${
                         selectedAnalysis?.id === item.id
-                          ? "border-slate-900 bg-slate-50 shadow-xs"
-                          : "border-slate-150 hover:border-slate-300 hover:bg-slate-50/50"
+                          ? "border-slate-900 bg-slate-50 shadow-xs ring-1 ring-slate-900/10"
+                          : "border-slate-200 bg-white hover:border-slate-300 hover:bg-slate-50/60"
                       }`}
                     >
-                      <div className="flex items-start gap-2.5 min-w-0">
-                        <div className="mt-0.5 shrink-0">
-                          {getContentTypeIcon(item.contentType)}
-                        </div>
-                        <div className="min-w-0">
-                          <h4 className="text-xs font-semibold text-slate-800 truncate leading-tight pr-4">
-                            {item.title}
-                          </h4>
-                          <div className="flex items-center gap-2 mt-1">
-                            <span className="text-[10px] font-mono text-slate-400">
-                              {new Date(item.analyzedAt).toLocaleDateString("es-ES")}
-                            </span>
-                            <span className="text-[10px] font-mono text-indigo-600 bg-indigo-50 border border-indigo-100 px-1.5 py-0.2 rounded-full font-medium">
-                              {item.originalLanguage.toUpperCase()}
-                            </span>
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="flex items-start gap-2 min-w-0">
+                          <div className="mt-0.5 shrink-0">
+                            {getContentTypeIcon(item.contentType)}
+                          </div>
+                          <div className="min-w-0">
+                            <h4 className="text-xs font-semibold text-slate-800 leading-snug line-clamp-2">
+                              {item.title}
+                            </h4>
+                            <div className="flex items-center gap-2 mt-1">
+                              <span className="text-[10px] font-mono text-slate-400">
+                                {new Date(item.analyzedAt).toLocaleDateString("es-ES")}
+                              </span>
+                              <span className="text-[10px] font-mono text-indigo-600 bg-indigo-50 border border-indigo-100 px-1.5 py-0.2 rounded-full font-medium">
+                                {item.originalLanguage.toUpperCase()}
+                              </span>
+                              <span className="text-[10px] font-mono text-slate-500 bg-slate-100 px-1.5 py-0.2 rounded-full font-medium">
+                                Score: {item.overallReliabilityScore}/100
+                              </span>
+                            </div>
                           </div>
                         </div>
                       </div>
 
-                      <button
-                        onClick={(e) => deleteAnalysis(item.id, e)}
-                        className="opacity-0 group-hover:opacity-100 p-1 hover:bg-rose-50 hover:text-rose-600 rounded text-slate-400 transition-all absolute right-2 top-2.5 cursor-pointer"
-                        title="Eliminar registro"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
+                      {/* Card Action Toolbar */}
+                      <div className="flex items-center justify-between border-t border-slate-100 pt-2 mt-0.5" onClick={(e) => e.stopPropagation()}>
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            onClick={() => handleCopyNotion(item)}
+                            className="text-[11px] text-slate-600 hover:text-indigo-600 hover:bg-indigo-50 px-2 py-1 rounded transition-colors flex items-center gap-1 font-medium cursor-pointer border border-transparent hover:border-indigo-100"
+                            title="Copiar para Notion"
+                          >
+                            <Copy className="w-3 h-3 text-indigo-500" />
+                            Notion
+                          </button>
+                          <button
+                            onClick={() => handleDownloadMarkdown(item)}
+                            className="text-[11px] text-slate-600 hover:text-emerald-600 hover:bg-emerald-50 px-2 py-1 rounded transition-colors flex items-center gap-1 font-medium cursor-pointer border border-transparent hover:border-emerald-100"
+                            title="Descargar archivo Markdown"
+                          >
+                            <Download className="w-3 h-3 text-emerald-500" />
+                            .md
+                          </button>
+                        </div>
+
+                        <button
+                          onClick={(e) => requestDeleteAnalysis(item.id, item.title, e)}
+                          className="text-[11px] text-slate-400 hover:text-rose-600 hover:bg-rose-50 px-2 py-1 rounded transition-colors flex items-center gap-1 cursor-pointer"
+                          title="Eliminar este análisis"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                          <span>Eliminar</span>
+                        </button>
+                      </div>
                     </div>
                   ))
                 )}
@@ -761,19 +1069,59 @@ export default function App() {
                         </span>
                       </div>
                       
-                      <div className="flex items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-2.5">
+                        <button
+                          onClick={() => handleCopyNotion()}
+                          className={`text-xs px-3.5 py-1.5 rounded-lg flex items-center gap-2 transition-all font-medium border shadow-xs cursor-pointer ${
+                            copiedNotion
+                              ? "bg-emerald-600 text-white border-emerald-700 shadow-sm"
+                              : "bg-white text-slate-800 border-slate-300 hover:bg-slate-50 hover:border-slate-400 hover:text-slate-900"
+                          }`}
+                          title="Copiar contenido en formato Markdown estructurado para Notion"
+                        >
+                          {copiedNotion ? (
+                            <>
+                              <Check className="w-4 h-4 text-white shrink-0" />
+                              <span className="font-semibold text-white">¡Copiado para Notion!</span>
+                            </>
+                          ) : (
+                            <>
+                              <Copy className="w-4 h-4 text-indigo-600 shrink-0" />
+                              <span className="font-semibold text-slate-800">Copiar para Notion</span>
+                            </>
+                          )}
+                        </button>
+
+                        <button
+                          onClick={() => handleDownloadMarkdown()}
+                          className="text-xs text-slate-800 bg-white border border-slate-300 hover:bg-slate-50 hover:border-slate-400 hover:text-slate-900 px-3.5 py-1.5 rounded-lg flex items-center gap-2 transition-all font-medium shadow-xs cursor-pointer"
+                          title="Descargar análisis completo como archivo Markdown (.md) para importar a Notion"
+                        >
+                          <Download className="w-4 h-4 text-emerald-600 shrink-0" />
+                          <span className="font-semibold text-slate-800">Descargar .md</span>
+                        </button>
+
                         {selectedAnalysis.url && (
                           <a
                             href={selectedAnalysis.url}
                             target="_blank"
                             referrerPolicy="no-referrer"
                             rel="noreferrer"
-                            className="text-xs text-indigo-600 bg-indigo-50 border border-indigo-100 hover:bg-indigo-100 px-3 py-1.5 rounded-lg flex items-center gap-1 transition-all"
+                            className="text-xs text-indigo-700 bg-indigo-50 border border-indigo-200 hover:bg-indigo-100 hover:border-indigo-300 px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-all font-medium"
                           >
-                            <ExternalLink className="w-3.5 h-3.5" />
-                            Ver Recurso Original
+                            <ExternalLink className="w-3.5 h-3.5 text-indigo-600" />
+                            Ver Original
                           </a>
                         )}
+
+                        <button
+                          onClick={() => requestDeleteAnalysis(selectedAnalysis.id, selectedAnalysis.title)}
+                          className="text-xs text-slate-400 hover:text-rose-600 hover:bg-rose-50 border border-transparent hover:border-rose-200 px-2.5 py-1.5 rounded-lg flex items-center gap-1 transition-all cursor-pointer"
+                          title="Eliminar este análisis"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          <span>Eliminar</span>
+                        </button>
                       </div>
                     </div>
 
@@ -952,7 +1300,7 @@ export default function App() {
                       
                       <div className="space-y-4">
                         {selectedAnalysis.criticalPositions.map((crit, idx) => (
-                          <div key={idx} className="p-4 bg-rose-50/40 border border-rose-150 rounded-lg space-y-2">
+                          <div key={idx} className="p-4 bg-rose-50/40 border border-rose-150 rounded-lg space-y-3">
                             <div className="flex items-center gap-2">
                               <span className="text-xs font-mono font-bold text-rose-800 bg-rose-100/80 px-2 py-0.5 rounded">
                                 Posición #{idx + 1}
@@ -970,6 +1318,77 @@ export default function App() {
                                 <strong className="text-rose-900 font-semibold">Fundamento Científico/Empírico:</strong> {crit.scientificBasis}
                               </span>
                             </div>
+
+                            {/* Verified Peer-Reviewed Empirical Study Badge & Reference */}
+                            {crit.supportingStudy && (
+                              <div className="mt-3 p-3 bg-white border border-rose-200/90 rounded-lg text-xs shadow-2xs space-y-2">
+                                <div className="flex flex-wrap items-center justify-between gap-2 pb-1.5 border-b border-slate-100">
+                                  <div className="flex items-center gap-1.5 text-emerald-800 font-medium">
+                                    <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0" />
+                                    <span className="font-mono text-[11px] font-bold text-emerald-800">
+                                      Evidencia Empírica Contrastada en Registro Científico
+                                    </span>
+                                  </div>
+                                  {crit.supportingStudy.citationsCount !== undefined && crit.supportingStudy.citationsCount !== null && (
+                                    <span className="text-[10px] font-mono text-slate-600 bg-slate-100 border border-slate-200 px-2 py-0.5 rounded">
+                                      {crit.supportingStudy.citationsCount} citas registradas
+                                    </span>
+                                  )}
+                                </div>
+                                
+                                <div>
+                                  <h5 className="font-display font-semibold text-slate-900 text-xs leading-snug">
+                                    {crit.supportingStudy.title}
+                                  </h5>
+                                  <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-slate-500 mt-1">
+                                    <span>Autor/es: <strong className="text-slate-700 font-semibold">{crit.supportingStudy.author}</strong></span>
+                                    {crit.supportingStudy.year && <span>Año: <strong>{crit.supportingStudy.year}</strong></span>}
+                                    {crit.supportingStudy.journalOrVenue && <span>Revista: <strong className="italic text-slate-700">{crit.supportingStudy.journalOrVenue}</strong></span>}
+                                  </div>
+                                </div>
+
+                                <div className="flex flex-wrap items-center gap-2 pt-1">
+                                  {crit.supportingStudy.doi && (
+                                    <a
+                                      href={crit.supportingStudy.doi}
+                                      target="_blank"
+                                      referrerPolicy="no-referrer"
+                                      rel="noreferrer"
+                                      className="inline-flex items-center gap-1 text-[10px] font-semibold text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 px-2 py-0.5 rounded transition-colors"
+                                      title="Enlace DOI oficial al estudio"
+                                    >
+                                      DOI / Paper Oficial
+                                      <ExternalLink className="w-2.5 h-2.5" />
+                                    </a>
+                                  )}
+                                  {crit.supportingStudy.openAccessUrl && (
+                                    <a
+                                      href={crit.supportingStudy.openAccessUrl}
+                                      target="_blank"
+                                      referrerPolicy="no-referrer"
+                                      rel="noreferrer"
+                                      className="inline-flex items-center gap-1 text-[10px] font-semibold text-teal-700 bg-teal-50 hover:bg-teal-100 border border-teal-200 px-2 py-0.5 rounded transition-colors"
+                                      title="Texto completo Open Access"
+                                    >
+                                      PDF Abierto
+                                      <ExternalLink className="w-2.5 h-2.5" />
+                                    </a>
+                                  )}
+                                  {crit.supportingStudy.link && (
+                                    <a
+                                      href={crit.supportingStudy.link}
+                                      target="_blank"
+                                      referrerPolicy="no-referrer"
+                                      rel="noreferrer"
+                                      className="inline-flex items-center gap-1 text-[10px] font-medium text-slate-600 bg-slate-50 hover:bg-slate-100 border border-slate-200 px-2 py-0.5 rounded transition-colors"
+                                    >
+                                      Google Scholar
+                                      <ExternalLink className="w-2.5 h-2.5" />
+                                    </a>
+                                  )}
+                                </div>
+                              </div>
+                            )}
                           </div>
                         ))}
                       </div>
@@ -1064,17 +1483,17 @@ export default function App() {
                           </h3>
                         </div>
                         <span className="text-[10px] font-mono font-bold text-amber-800 bg-amber-100 border border-amber-300 px-2.5 py-0.5 rounded-full flex items-center gap-1">
-                          Nivel Universitario
+                          Nivel Universitario & Evidencia Probada
                         </span>
                       </div>
                       <p className="text-xs text-slate-600 mb-5">
-                        Explicaciones pedagógicas e intuitivas sin asunción de conocimientos previos para facilitar la comprensión de los términos técnicos y filosóficos más complejos:
+                        Explicaciones pedagógicas con ejemplos intuitivos de la vida cotidiana y respaldo en evidencias científicas reales contrastadas para facilitar el aprendizaje profundo:
                       </p>
 
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         {selectedAnalysis.glossary.map((item, idx) => (
-                          <div key={idx} className="p-4 bg-white/90 border border-amber-200/70 rounded-lg shadow-xs flex flex-col justify-between space-y-3 hover:border-amber-300 transition-colors">
-                            <div className="space-y-1.5">
+                          <div key={idx} className="p-4 bg-white/95 border border-amber-200/80 rounded-xl shadow-xs flex flex-col justify-between space-y-3.5 hover:border-amber-300 hover:shadow-sm transition-all">
+                            <div className="space-y-2.5">
                               <div className="flex items-center gap-2">
                                 <span className="text-[10px] font-mono font-bold text-amber-800 bg-amber-100 px-2 py-0.5 rounded">
                                   Concepto #{idx + 1}
@@ -1083,13 +1502,40 @@ export default function App() {
                                   {item.term}
                                 </h4>
                               </div>
+
                               <p className="text-xs text-slate-700 leading-relaxed font-sans">
                                 {item.definition}
                               </p>
+
+                              {/* Simple Everyday Example */}
+                              {item.simpleExample && (
+                                <div className="p-3 bg-amber-50/90 border border-amber-200/80 rounded-lg text-xs space-y-1">
+                                  <div className="flex items-center gap-1.5 text-amber-900 font-semibold text-[11px]">
+                                    <Lightbulb className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                                    <span>Ejemplo Sencillo e Intuitivo</span>
+                                  </div>
+                                  <p className="text-slate-700 leading-relaxed text-[11.5px]">
+                                    {item.simpleExample}
+                                  </p>
+                                </div>
+                              )}
+
+                              {/* Scientific Evidence and Proven Foundation */}
+                              {item.scientificEvidenceOrSource && (
+                                <div className="p-3 bg-emerald-50/80 border border-emerald-200/70 rounded-lg text-xs space-y-1">
+                                  <div className="flex items-center gap-1.5 text-emerald-900 font-semibold text-[11px]">
+                                    <ShieldCheck className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                                    <span>Evidencia Científica & Base Probada</span>
+                                  </div>
+                                  <p className="text-slate-700 leading-relaxed text-[11.5px]">
+                                    {item.scientificEvidenceOrSource}
+                                  </p>
+                                </div>
+                              )}
                             </div>
 
                             {item.referenceUrl && (
-                              <div className="pt-2 border-t border-amber-100/80 flex justify-end">
+                              <div className="pt-2 border-t border-amber-100/90 flex justify-end">
                                 <a
                                   href={item.referenceUrl}
                                   target="_blank"
@@ -1098,7 +1544,7 @@ export default function App() {
                                   className="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-800 bg-amber-50 hover:bg-amber-100 border border-amber-200/80 px-2.5 py-1 rounded-md transition-colors"
                                   title={`Consultar fuente educativa para ${item.term}`}
                                 >
-                                  Saber más
+                                  Consultar en Repositorio
                                   <ExternalLink className="w-3 h-3" />
                                 </a>
                               </div>
@@ -1196,92 +1642,140 @@ export default function App() {
 
                     {/* Source Cards */}
                     <div className="space-y-6">
-                      {selectedAnalysis.bibliographicSources.map((source, idx) => (
-                        <div key={idx} className="border border-slate-150 rounded-xl p-5 hover:border-slate-350 transition-all bg-white shadow-xs">
-                          <div className="flex flex-col md:flex-row md:items-start justify-between gap-4 mb-4">
-                            <div className="space-y-1">
-                              <div className="flex flex-wrap items-center gap-2">
-                                <span className="text-[10px] font-mono font-semibold uppercase tracking-wider text-indigo-600 bg-indigo-50 border border-indigo-100 px-2 py-0.5 rounded">
-                                  {source.type}
-                                </span>
-                                {source.year && (
-                                  <span className="text-[10px] font-mono font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded flex items-center gap-1">
-                                    <Calendar className="w-3 h-3" />
-                                    {source.year}
+                      {selectedAnalysis.bibliographicSources.map((source, idx) => {
+                        const firstAuthor = (source.author || "").split(",")[0].split(" y ")[0].trim();
+                        const exactScholarQuery = `"${source.title}" ${firstAuthor}`.trim();
+                        const exactJstorQuery = `"${source.title}"`;
+
+                        return (
+                          <div key={idx} className="border border-slate-150 rounded-xl p-5 hover:border-slate-350 transition-all bg-white shadow-xs">
+                            <div className="flex flex-col md:flex-row md:items-start justify-between gap-4 mb-4">
+                              <div className="space-y-1.5 flex-1">
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <span className="text-[10px] font-mono font-semibold uppercase tracking-wider text-indigo-600 bg-indigo-50 border border-indigo-100 px-2 py-0.5 rounded">
+                                    {source.type}
                                   </span>
-                                )}
+                                  {source.year && (
+                                    <span className="text-[10px] font-mono font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded flex items-center gap-1">
+                                      <Calendar className="w-3 h-3" />
+                                      {source.year}
+                                    </span>
+                                  )}
+                                  {source.isVerified !== false && (
+                                    <span className="text-[10px] font-mono font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded flex items-center gap-1">
+                                      <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
+                                      Indexado en Repositorio Oficial
+                                    </span>
+                                  )}
+                                  {source.citationsCount !== undefined && source.citationsCount !== null && (
+                                    <span className="text-[10px] font-mono text-slate-600 bg-slate-100 border border-slate-200 px-2 py-0.5 rounded">
+                                      {source.citationsCount} citas
+                                    </span>
+                                  )}
+                                </div>
                                 <h4 className="font-display font-bold text-base text-slate-900 leading-snug">
                                   {source.title}
                                 </h4>
+                                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-500 font-medium">
+                                  <p>Autor/es: <span className="text-slate-800 font-semibold">{source.author}</span></p>
+                                  {source.journalOrVenue && (
+                                    <p>Revista / Editorial: <span className="text-slate-800 font-semibold italic">{source.journalOrVenue}</span></p>
+                                  )}
+                                </div>
                               </div>
-                              <p className="text-xs text-slate-500 font-medium">Autor / Creador: <span className="text-slate-800 font-semibold">{source.author}</span></p>
+
+                              {/* Score Display Card */}
+                              <div className={`shrink-0 border rounded-lg px-3 py-1.5 flex flex-col items-center justify-center min-w-[100px] ${getScoreColor(source.reliabilityScore)}`}>
+                                <span className="text-xs font-mono font-medium text-slate-500">Fiabilidad</span>
+                                <span className="text-xl font-mono font-bold">{source.reliabilityScore}/100</span>
+                              </div>
                             </div>
 
-                            {/* Score Display Card */}
-                            <div className={`shrink-0 border rounded-lg px-3 py-1.5 flex flex-col items-center justify-center min-w-[100px] ${getScoreColor(source.reliabilityScore)}`}>
-                              <span className="text-xs font-mono font-medium text-slate-500">Fiabilidad</span>
-                              <span className="text-xl font-mono font-bold">{source.reliabilityScore}/100</span>
+                            {/* Progress bar gauge */}
+                            <div className="w-full bg-slate-100 h-1.5 rounded-full overflow-hidden mb-4">
+                              <div className={`h-full ${getProgressBarColor(source.reliabilityScore)} rounded-full`} style={{ width: `${source.reliabilityScore}%` }}></div>
+                            </div>
+
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-5 mt-4 border-t border-slate-100 pt-4 text-xs">
+                              <div className="space-y-2">
+                                <h5 className="font-semibold text-slate-800 flex items-center gap-1">
+                                  <FileText className="w-3.5 h-3.5 text-slate-500" />
+                                  Sinopsis y Contribución
+                                </h5>
+                                <p className="text-slate-600 leading-relaxed">{source.summary}</p>
+                              </div>
+
+                              <div className="space-y-2">
+                                <h5 className="font-semibold text-slate-800 flex items-center gap-1">
+                                  <Search className="w-3.5 h-3.5 text-indigo-600" />
+                                  Análisis Crítico y Contraste
+                                </h5>
+                                <p className="text-slate-600 leading-relaxed italic">"{source.criticalAnalysis}"</p>
+                              </div>
+                            </div>
+
+                            <div className="mt-4 p-3 bg-slate-50 border border-slate-100 rounded-lg text-xs flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+                              <div className="flex items-start sm:items-center gap-2">
+                                <Award className="w-4 h-4 text-slate-400 mt-0.5 sm:mt-0 shrink-0" />
+                                <span className="text-slate-600 font-mono text-[11px]">
+                                  <strong className="text-slate-800">Evaluación del Rigor:</strong> {source.academicRigor}
+                                </span>
+                              </div>
+                              
+                              <div className="flex flex-wrap items-center gap-2 shrink-0 self-end lg:self-auto">
+                                {source.doi && (
+                                  <a
+                                    href={source.doi}
+                                    target="_blank"
+                                    referrerPolicy="no-referrer"
+                                    rel="noreferrer"
+                                    className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 px-2.5 py-1 rounded-md transition-colors"
+                                    title="Enlace DOI directo al artículo oficial"
+                                  >
+                                    DOI / Paper
+                                    <ExternalLink className="w-3 h-3" />
+                                  </a>
+                                )}
+                                {source.openAccessUrl && (
+                                  <a
+                                    href={source.openAccessUrl}
+                                    target="_blank"
+                                    referrerPolicy="no-referrer"
+                                    rel="noreferrer"
+                                    className="inline-flex items-center gap-1 text-[11px] font-semibold text-teal-700 bg-teal-50 hover:bg-teal-100 border border-teal-200 px-2.5 py-1 rounded-md transition-colors"
+                                    title="Descargar o leer texto completo en Open Access"
+                                  >
+                                    PDF Abierto
+                                    <ExternalLink className="w-3 h-3" />
+                                  </a>
+                                )}
+                                <a
+                                  href={`https://scholar.google.com/scholar?q=${encodeURIComponent(exactScholarQuery)}`}
+                                  target="_blank"
+                                  referrerPolicy="no-referrer"
+                                  rel="noreferrer"
+                                  className="inline-flex items-center gap-1 text-[11px] font-semibold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 px-2.5 py-1 rounded-md transition-colors"
+                                  title="Buscar este artículo exacto en Google Scholar"
+                                >
+                                  Google Scholar
+                                  <ExternalLink className="w-3 h-3" />
+                                </a>
+                                <a
+                                  href={`https://www.jstor.org/action/doBasicSearch?Query=${encodeURIComponent(exactJstorQuery)}`}
+                                  target="_blank"
+                                  referrerPolicy="no-referrer"
+                                  rel="noreferrer"
+                                  className="inline-flex items-center gap-1 text-[11px] font-semibold text-slate-700 bg-white hover:bg-slate-100 border border-slate-200 px-2.5 py-1 rounded-md transition-colors"
+                                  title="Buscar el título exacto en JSTOR"
+                                >
+                                  JSTOR
+                                  <ExternalLink className="w-3 h-3" />
+                                </a>
+                              </div>
                             </div>
                           </div>
-
-                          {/* Progress bar gauge */}
-                          <div className="w-full bg-slate-100 h-1.5 rounded-full overflow-hidden mb-4">
-                            <div className={`h-full ${getProgressBarColor(source.reliabilityScore)} rounded-full`} style={{ width: `${source.reliabilityScore}%` }}></div>
-                          </div>
-
-                          <div className="grid grid-cols-1 md:grid-cols-2 gap-5 mt-4 border-t border-slate-100 pt-4 text-xs">
-                            <div className="space-y-2">
-                              <h5 className="font-semibold text-slate-800 flex items-center gap-1">
-                                <FileText className="w-3.5 h-3.5 text-slate-500" />
-                                Sinopsis y Contribución
-                              </h5>
-                              <p className="text-slate-600 leading-relaxed">{source.summary}</p>
-                            </div>
-
-                            <div className="space-y-2">
-                              <h5 className="font-semibold text-slate-800 flex items-center gap-1">
-                                <Search className="w-3.5 h-3.5 text-indigo-600" />
-                                Análisis Crítico y Contraste
-                              </h5>
-                              <p className="text-slate-600 leading-relaxed italic">"{source.criticalAnalysis}"</p>
-                            </div>
-                          </div>
-
-                          <div className="mt-4 p-3 bg-slate-50 border border-slate-100 rounded-lg text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                            <div className="flex items-start sm:items-center gap-2">
-                              <Award className="w-4 h-4 text-slate-400 mt-0.5 sm:mt-0 shrink-0" />
-                              <span className="text-slate-600 font-mono text-[11px]">
-                                <strong className="text-slate-800">Evaluación del Rigor:</strong> {source.academicRigor}
-                              </span>
-                            </div>
-                            
-                            <div className="flex flex-wrap items-center gap-2 shrink-0 self-end sm:self-auto">
-                              <a
-                                href={`https://scholar.google.com/scholar?q=${encodeURIComponent(`${source.title} ${source.author}`)}`}
-                                target="_blank"
-                                referrerPolicy="no-referrer"
-                                rel="noreferrer"
-                                className="inline-flex items-center gap-1 text-[11px] font-semibold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 px-2.5 py-1 rounded-md transition-colors"
-                                title="Buscar este artículo directamente en Google Scholar"
-                              >
-                                Google Scholar
-                                <ExternalLink className="w-3 h-3" />
-                              </a>
-                              <a
-                                href={`https://www.jstor.org/action/doBasicSearch?Query=${encodeURIComponent(source.title)}`}
-                                target="_blank"
-                                referrerPolicy="no-referrer"
-                                rel="noreferrer"
-                                className="inline-flex items-center gap-1 text-[11px] font-semibold text-slate-700 bg-white hover:bg-slate-100 border border-slate-200 px-2.5 py-1 rounded-md transition-colors"
-                                title="Buscar en JSTOR"
-                              >
-                                JSTOR
-                                <ExternalLink className="w-3 h-3" />
-                              </a>
-                            </div>
-                          </div>
-                        </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   </div>
 
@@ -1328,6 +1822,118 @@ export default function App() {
         <p>© 2026 Lupa Crítica - Gabinete Académico de Rigor Cognitivo e Investigación.</p>
         <p className="mt-1">Implementando técnicas de traducción automática e investigación heurística con IA.</p>
       </footer>
+
+      {/* Floating Action Bar for Quick Export when viewing a report */}
+      {selectedAnalysis && !loading && (
+        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-40 bg-slate-900/90 text-white backdrop-blur-md px-4 py-2.5 rounded-full shadow-xl border border-slate-700/80 flex items-center gap-3 animate-fadeIn">
+          <div className="hidden sm:flex items-center gap-2 pr-2 border-r border-slate-700 max-w-[200px] truncate">
+            {getContentTypeIcon(selectedAnalysis.contentType)}
+            <span className="text-xs font-medium text-slate-200 truncate">{selectedAnalysis.title}</span>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => handleCopyNotion()}
+              className={`text-xs px-3 py-1.5 rounded-full flex items-center gap-1.5 transition-all font-medium cursor-pointer shadow-xs ${
+                copiedNotion
+                  ? "bg-emerald-500 text-white"
+                  : "bg-indigo-600 hover:bg-indigo-500 text-white"
+              }`}
+              title="Copiar contenido formateado para Notion"
+            >
+              {copiedNotion ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+              <span>{copiedNotion ? "¡Copiado!" : "Copiar Notion"}</span>
+            </button>
+
+            <button
+              onClick={() => handleDownloadMarkdown()}
+              className="text-xs bg-slate-800 hover:bg-slate-700 text-slate-100 hover:text-white px-3 py-1.5 rounded-full flex items-center gap-1.5 transition-all font-medium border border-slate-600 cursor-pointer shadow-xs"
+              title="Descargar archivo Markdown (.md)"
+            >
+              <Download className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Descargar .md</span>
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Delete Single Item Confirmation Modal */}
+      {deleteTarget && (
+        <div 
+          className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 animate-fadeIn"
+          onClick={() => setDeleteTarget(null)}
+        >
+          <div 
+            className="bg-white border border-slate-200 rounded-xl p-6 max-w-md w-full shadow-xl space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center gap-3 text-rose-600">
+              <div className="p-2.5 bg-rose-50 rounded-full border border-rose-100">
+                <Trash2 className="w-5 h-5" />
+              </div>
+              <h3 className="text-base font-semibold font-display text-slate-900">¿Eliminar análisis del historial?</h3>
+            </div>
+            
+            <p className="text-xs text-slate-600 leading-relaxed">
+              Estás a punto de eliminar <strong className="text-slate-800">"{deleteTarget.title}"</strong>. Esta acción retirará el registro del panel y de la base de datos persistente.
+            </p>
+
+            <div className="flex items-center justify-end gap-2.5 pt-2 border-t border-slate-100">
+              <button
+                onClick={() => setDeleteTarget(null)}
+                className="text-xs px-3.5 py-2 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 font-medium cursor-pointer transition-colors"
+              >
+                Cancelar
+              </button>
+              <button
+                onClick={() => executeDelete(deleteTarget.id)}
+                className="text-xs px-3.5 py-2 rounded-lg bg-rose-600 hover:bg-rose-700 text-white font-medium cursor-pointer transition-colors shadow-xs"
+              >
+                Sí, eliminar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Clear All Confirmation Modal */}
+      {showClearAllModal && (
+        <div 
+          className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 animate-fadeIn"
+          onClick={() => setShowClearAllModal(false)}
+        >
+          <div 
+            className="bg-white border border-slate-200 rounded-xl p-6 max-w-md w-full shadow-xl space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center gap-3 text-rose-600">
+              <div className="p-2.5 bg-rose-50 rounded-full border border-rose-100">
+                <AlertCircle className="w-5 h-5" />
+              </div>
+              <h3 className="text-base font-semibold font-display text-slate-900">¿Vaciar todo el historial?</h3>
+            </div>
+            
+            <p className="text-xs text-slate-600 leading-relaxed">
+              Se eliminarán todos los {analyses.length} análisis almacenados de forma permanente.
+            </p>
+
+            <div className="flex items-center justify-end gap-2.5 pt-2 border-t border-slate-100">
+              <button
+                onClick={() => setShowClearAllModal(false)}
+                className="text-xs px-3.5 py-2 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 font-medium cursor-pointer transition-colors"
+              >
+                Cancelar
+              </button>
+              <button
+                onClick={executeClearAll}
+                className="text-xs px-3.5 py-2 rounded-lg bg-rose-600 hover:bg-rose-700 text-white font-medium cursor-pointer transition-colors shadow-xs"
+              >
+                Vaciar todo
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Image Lightbox Modal */}
       {viewingPhoto && (
