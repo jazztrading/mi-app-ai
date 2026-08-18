@@ -35,7 +35,8 @@ import {
   Copy,
   Check,
   Download,
-  Lightbulb
+  Lightbulb,
+  History
 } from "lucide-react";
 import {
   BarChart,
@@ -536,7 +537,7 @@ export default function App() {
         md += `### ${idx + 1}. ${term.term}\n\n`;
         md += `- **Definición:** ${term.definition}\n`;
         if (term.simpleExample) {
-          md += `- **Ejemplo Sencillo e Intuitivo:** ${term.simpleExample}\n`;
+          md += `- **Ejemplo Práctico y Precedente Histórico / Caso Real:** ${term.simpleExample}\n`;
         }
         if (term.scientificEvidenceOrSource) {
           md += `- **Evidencia Científica y Fuente Probada:** ${term.scientificEvidenceOrSource}\n`;
@@ -1483,38 +1484,40 @@ export default function App() {
                           </h3>
                         </div>
                         <span className="text-[10px] font-mono font-bold text-amber-800 bg-amber-100 border border-amber-300 px-2.5 py-0.5 rounded-full flex items-center gap-1">
-                          Nivel Universitario & Evidencia Probada
+                          Casos Reales & Evidencia Contrastada
                         </span>
                       </div>
                       <p className="text-xs text-slate-600 mb-5">
-                        Explicaciones pedagógicas con ejemplos intuitivos de la vida cotidiana y respaldo en evidencias científicas reales contrastadas para facilitar el aprendizaje profundo:
+                        Definiciones rigurosas explicadas mediante precedentes históricos documentados, casos reales contrastados y respaldo en evidencias empíricas comprobables:
                       </p>
 
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         {selectedAnalysis.glossary.map((item, idx) => (
-                          <div key={idx} className="p-4 bg-white/95 border border-amber-200/80 rounded-xl shadow-xs flex flex-col justify-between space-y-3.5 hover:border-amber-300 hover:shadow-sm transition-all">
-                            <div className="space-y-2.5">
-                              <div className="flex items-center gap-2">
-                                <span className="text-[10px] font-mono font-bold text-amber-800 bg-amber-100 px-2 py-0.5 rounded">
-                                  Concepto #{idx + 1}
-                                </span>
-                                <h4 className="font-display font-bold text-sm text-slate-900">
-                                  {item.term}
-                                </h4>
+                          <div key={idx} className="p-4 bg-white/95 border border-amber-200/80 rounded-xl shadow-xs flex flex-col justify-between space-y-4 hover:border-amber-300 hover:shadow-sm transition-all">
+                            <div className="space-y-3">
+                              <div className="flex items-center justify-between gap-2 border-b border-amber-100/80 pb-2">
+                                <div className="flex items-center gap-2">
+                                  <span className="text-[10px] font-mono font-bold text-amber-900 bg-amber-100/90 px-2 py-0.5 rounded">
+                                    Concepto #{idx + 1}
+                                  </span>
+                                  <h4 className="font-display font-bold text-sm text-slate-900">
+                                    {item.term}
+                                  </h4>
+                                </div>
                               </div>
 
-                              <p className="text-xs text-slate-700 leading-relaxed font-sans">
-                                {item.definition}
-                              </p>
+                              <div className="text-xs text-slate-700 leading-relaxed font-sans bg-slate-50/70 p-2.5 rounded-lg border border-slate-100">
+                                <p className="font-medium text-slate-800">{item.definition}</p>
+                              </div>
 
-                              {/* Simple Everyday Example */}
+                              {/* Elaborated Case / Practical and Historical Precedent */}
                               {item.simpleExample && (
-                                <div className="p-3 bg-amber-50/90 border border-amber-200/80 rounded-lg text-xs space-y-1">
-                                  <div className="flex items-center gap-1.5 text-amber-900 font-semibold text-[11px]">
-                                    <Lightbulb className="w-3.5 h-3.5 text-amber-600 shrink-0" />
-                                    <span>Ejemplo Sencillo e Intuitivo</span>
+                                <div className="p-3 bg-amber-50/90 border border-amber-200/80 rounded-lg text-xs space-y-1.5">
+                                  <div className="flex items-center gap-1.5 text-amber-950 font-semibold text-[11px]">
+                                    <History className="w-3.5 h-3.5 text-amber-700 shrink-0" />
+                                    <span>Ejemplo Práctico & Precedente Histórico Real</span>
                                   </div>
-                                  <p className="text-slate-700 leading-relaxed text-[11.5px]">
+                                  <p className="text-slate-700 leading-relaxed text-[11.5px] font-normal">
                                     {item.simpleExample}
                                   </p>
                                 </div>
@@ -1522,12 +1525,12 @@ export default function App() {
 
                               {/* Scientific Evidence and Proven Foundation */}
                               {item.scientificEvidenceOrSource && (
-                                <div className="p-3 bg-emerald-50/80 border border-emerald-200/70 rounded-lg text-xs space-y-1">
-                                  <div className="flex items-center gap-1.5 text-emerald-900 font-semibold text-[11px]">
-                                    <ShieldCheck className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-                                    <span>Evidencia Científica & Base Probada</span>
+                                <div className="p-3 bg-emerald-50/80 border border-emerald-200/70 rounded-lg text-xs space-y-1.5">
+                                  <div className="flex items-center gap-1.5 text-emerald-950 font-semibold text-[11px]">
+                                    <ShieldCheck className="w-3.5 h-3.5 text-emerald-700 shrink-0" />
+                                    <span>Evidencia Científica & Fuente Comprobable</span>
                                   </div>
-                                  <p className="text-slate-700 leading-relaxed text-[11.5px]">
+                                  <p className="text-slate-700 leading-relaxed text-[11.5px] font-normal">
                                     {item.scientificEvidenceOrSource}
                                   </p>
                                 </div>
@@ -1541,11 +1544,11 @@ export default function App() {
                                   target="_blank"
                                   referrerPolicy="no-referrer"
                                   rel="noreferrer"
-                                  className="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-800 bg-amber-50 hover:bg-amber-100 border border-amber-200/80 px-2.5 py-1 rounded-md transition-colors"
+                                  className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-amber-900 bg-amber-50 hover:bg-amber-100 border border-amber-200/90 px-2.5 py-1 rounded-md transition-colors shadow-2xs"
                                   title={`Consultar fuente educativa para ${item.term}`}
                                 >
-                                  Consultar en Repositorio
-                                  <ExternalLink className="w-3 h-3" />
+                                  <span>Consultar en Repositorio Oficial</span>
+                                  <ExternalLink className="w-3 h-3 text-amber-700" />
                                 </a>
                               </div>
                             )}

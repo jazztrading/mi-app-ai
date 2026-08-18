@@ -123,12 +123,15 @@ async function verifySingleScholarlyWork(
   rawAuthor?: string,
   contextKeywords?: string
 ): Promise<VerifiedScholarlyCitation | null> {
-  const cleanTitle = (rawTitle || "").replace(/["“”]/g, "").trim();
+  const cleanTitle = (rawTitle || "")
+    .replace(/["“”'']/g, "")
+    .replace(/^['"]|['"]$/g, "")
+    .trim();
   const firstAuthor = (rawAuthor || "").split(",")[0].split(" y ")[0].trim();
 
   if (!cleanTitle && !contextKeywords) return null;
 
-  // 1. Direct search in OpenAlex
+  // 1. Direct search in OpenAlex with clean title
   if (cleanTitle.length > 4) {
     try {
       const query = firstAuthor ? `"${cleanTitle}" ${firstAuthor}` : `"${cleanTitle}"`;
@@ -152,7 +155,7 @@ async function verifySingleScholarlyWork(
             citationsCount: match.cited_by_count,
             openAccessUrl: match.open_access?.oa_url || undefined,
             isVerified: true,
-            link: `https://scholar.google.com/scholar?q=${encodeURIComponent(`"${match.title}" ${firstA}`.trim())}`
+            link: match.doi ? (match.doi.startsWith("http") ? match.doi : `https://doi.org/${match.doi}`) : `https://scholar.google.com/scholar?q=${encodeURIComponent(`"${match.title}" ${firstA}`.trim())}`
           };
         }
       }
@@ -176,15 +179,16 @@ async function verifySingleScholarlyWork(
           const authors = item.author?.map((a: any) => `${a.given || ""} ${a.family || ""}`.trim()).filter(Boolean).join(", ") || rawAuthor || "Autores varios";
           const itemTitle = item.title[0];
           const itemAuthorFirst = (authors || "").split(",")[0].split(" y ")[0].trim();
+          const doiUrl = item.DOI ? (item.DOI.startsWith("http") ? item.DOI : `https://doi.org/${item.DOI}`) : undefined;
           return {
             title: itemTitle,
             author: authors,
             year: String(item.published?.["date-parts"]?.[0]?.[0] || "2023"),
-            doi: item.DOI ? (item.DOI.startsWith("http") ? item.DOI : `https://doi.org/${item.DOI}`) : undefined,
+            doi: doiUrl,
             journalOrVenue: item["container-title"]?.[0] || undefined,
             citationsCount: item["is-referenced-by-count"],
             isVerified: true,
-            link: `https://scholar.google.com/scholar?q=${encodeURIComponent(`"${itemTitle}" ${itemAuthorFirst}`.trim())}`
+            link: doiUrl || `https://scholar.google.com/scholar?q=${encodeURIComponent(`"${itemTitle}" ${itemAuthorFirst}`.trim())}`
           };
         }
       }
@@ -193,11 +197,12 @@ async function verifySingleScholarlyWork(
     }
   }
 
-  // 3. Fallback: Search OpenAlex with topic & concept keywords to match authentic peer-reviewed paper
-  const fallbackQuery = `${cleanTitle} ${contextKeywords || ""}`.replace(/[^a-zA-Z0-9áéíóúÁÉÍÓÚñÑ\s]/g, " ").trim().slice(0, 140);
-  if (fallbackQuery.length > 3) {
+  // 3. Fallback: Search OpenAlex by author names & concept keywords to find authentic published peer-reviewed work
+  const cleanKeywords = (contextKeywords || "").replace(/[^a-zA-Z0-9áéíóúÁÉÍÓÚñÑ\s]/g, " ").trim();
+  const searchFallback = `${firstAuthor ? firstAuthor + " " : ""}${cleanKeywords}`.trim().slice(0, 120);
+  if (searchFallback.length > 3) {
     try {
-      const url = `https://api.openalex.org/works?search=${encodeURIComponent(fallbackQuery)}&per_page=3&mailto=academic-verifier@example.com`;
+      const url = `https://api.openalex.org/works?search=${encodeURIComponent(searchFallback)}&per_page=3&mailto=academic-verifier@example.com`;
       const res = await fetch(url, {
         headers: { "User-Agent": "LupaCriticaAcademicBot/1.0" },
         signal: AbortSignal.timeout(4500)
@@ -205,19 +210,20 @@ async function verifySingleScholarlyWork(
       if (res.ok) {
         const data = await res.json();
         const top = data.results?.[0];
-        if (top) {
+        if (top && top.title) {
           const authorNames = top.authorships?.slice(0, 4).map((a: any) => a.author?.display_name).filter(Boolean).join(", ") || "Autores varios";
           const firstA = authorNames.split(",")[0].trim();
+          const doiUrl = top.doi ? (top.doi.startsWith("http") ? top.doi : `https://doi.org/${top.doi}`) : undefined;
           return {
             title: top.title,
             author: authorNames,
             year: String(top.publication_year || "2023"),
-            doi: top.doi ? (top.doi.startsWith("http") ? top.doi : `https://doi.org/${top.doi}`) : undefined,
+            doi: doiUrl,
             journalOrVenue: top.primary_location?.source?.display_name || undefined,
             citationsCount: top.cited_by_count,
             openAccessUrl: top.open_access?.oa_url || undefined,
             isVerified: true,
-            link: `https://scholar.google.com/scholar?q=${encodeURIComponent(`"${top.title}" ${firstA}`.trim())}`
+            link: doiUrl || `https://scholar.google.com/scholar?q=${encodeURIComponent(`"${top.title}" ${firstA}`.trim())}`
           };
         }
       }
@@ -272,6 +278,46 @@ async function verifyAndEnrichBibliographicSources(
   }
 
   return verifiedList;
+}
+
+// Helper to verify and enrich scientific evidence citations in the Glossary
+async function verifyGlossaryEvidence(
+  rawEvidence: string | undefined,
+  termName: string,
+  generalContext: string
+): Promise<{ evidenceText: string; verifiedUrl?: string }> {
+  if (!rawEvidence || rawEvidence.trim().length < 5) {
+    // If empty or vague, search for an authoritative scholarly paper on this concept
+    const verified = await verifySingleScholarlyWork("", "", `${termName} ${generalContext}`);
+    if (verified) {
+      const formatted = `${verified.author} (${verified.year}). '${verified.title}'. ${verified.journalOrVenue ? verified.journalOrVenue + '.' : 'Publicación indexada.'}`;
+      return {
+        evidenceText: formatted,
+        verifiedUrl: verified.link
+      };
+    }
+    return { evidenceText: "" };
+  }
+
+  // Extract possible author or title from string (e.g. "Bollen, N. P., & Whaley, R. E. (2004)...")
+  const titleMatch = rawEvidence.match(/['"“](.*?)['"”]/);
+  const rawTitle = titleMatch ? titleMatch[1] : "";
+  const rawAuthorMatch = rawEvidence.match(/^([A-Za-z\s,.\-&]+)\s*\(\d{4}\)/);
+  const rawAuthor = rawAuthorMatch ? rawAuthorMatch[1].trim() : "";
+
+  const verified = await verifySingleScholarlyWork(rawTitle, rawAuthor, `${termName} ${rawEvidence} ${generalContext}`);
+  if (verified) {
+    const formatted = `${verified.author} (${verified.year}). '${verified.title}'. ${verified.journalOrVenue ? verified.journalOrVenue + '.' : 'Publicación indexada en repositorio académico.'}${verified.doi ? ' DOI: ' + verified.doi : ''}`;
+    return {
+      evidenceText: formatted,
+      verifiedUrl: verified.link
+    };
+  }
+
+  return {
+    evidenceText: rawEvidence,
+    verifiedUrl: `https://scholar.google.com/scholar?q=${encodeURIComponent(`${termName} ${rawEvidence}`.slice(0, 100))}`
+  };
 }
 
 // Cache database loaded from disk
@@ -637,16 +683,16 @@ Instrucciones detalladas de análisis:
 
 10. **Gabinete de Fuentes Bibliográficas e Investigación Secundaria (Papers Reales Indexados)**:
    - Añade entre 4 y 5 fuentes bibliográficas 100% REALES, RELEVANTES Y COMPROBABLES (publicadas preferentemente entre 2020 y 2026 o investigaciones seminales de máxima autoridad indexadas).
-   - **ANTI-HALLUCINATION STRICT RULE**: ESTÁ ESTRICTAMENTE PROHIBIDO inventar o alterar títulos de papers o inventar coautores inexistentes. Cada fuente debe corresponder a una investigación verídica publicada en revistas científicas indexadas con revisión por pares (Google Scholar, JSTOR, Scopus, PubMed, IEEE, SSRN, NBER, ScienceDirect, Nature, Oxford, etc.). Proporciona el título exacto en su idioma original de publicación (inglés o español) y los nombres/apellidos exactos de los investigadores reales.
+   - **ANTI-HALLUCINATION ABSOLUTE RULE**: ESTÁ TERMINANTEMENTE PROHIBIDO inventar títulos de papers, sintetizar publicaciones inexistentes o asociar a investigadores reales con artículos que jamás publicaron (e.g., está prohibido inventar títulos ficticios como atribuir papers no publicados a Bollen & Whaley u otros autores). Cada fuente DEBE ser un documento verídico comprobable en Google Scholar, JSTOR, Scopus, PubMed, IEEE, SSRN, NBER, ScienceDirect o Nature. Cita el título exacto en su idioma original de publicación y los autores reales.
 
-11. **Glosario Didáctico de Conceptos Complejos con Ejemplos Sencillos y Evidencia Científica Probada**:
-   - Genera un glosario de 4 a 8 términos técnicos, metodológicos o filosóficos complejos explicados con tono didáctico claro para estudiantes universitarios sin asumir formación previa.
+11. **Glosario Didáctico con Ejemplos Elaborados, Precedentes Históricos y Evidencia Científica Rigurosa**:
+   - Genera un glosario de 4 a 8 términos técnicos, metodológicos, económicos o filosóficos complejos.
    - **Para cada concepto debes aportar obligatoriamente**:
      a) 'term': Nombre exacto del concepto o término técnico.
-     b) 'definition': Definición accesible, pedagógica y rigurosa.
-     c) 'simpleExample': Un ejemplo sencillo, cotidiano o intuitivo que permita comprender y visualizar el concepto en la práctica al instante.
-     d) 'scientificEvidenceOrSource': La evidencia empírica contrastada, experimento clásico probado, estudio científico o fuente académica rigurosa que demuestra y fundamenta este concepto en la literatura científica.
-     e) 'referenceUrl': Enlace directo o de búsqueda académica verificado.
+     b) 'definition': Definición accesible, pedagógica y rigurosa (nivel universitario sin jerga innecesaria).
+     c) 'simpleExample': Un caso práctico o precedente histórico sustancial, detallado y rigurosamente verídico (PROHIBIDO usar metáforas vacías o analogías simplistas). Relata qué ocurrió en la historia cuando un organismo (e.g. Reserva Federal, gobiernos, comunidad científica) aplicó o desoyó este principio, qué consecuencias medibles y contrastadas se produjeron y cómo se verifica documentalmente.
+     d) 'scientificEvidenceOrSource': Cita bibliográfica 100% REAL Y VERIFICABLE (autor/es, año exacto, título verídico y revista/institución indexada como AER, JFE, JF, QJE, NBER, BIS, FED, Nature, Science, etc.) que fundamenta este concepto en la literatura empírica. Si no recuerdas el título exacto de un paper contemporáneo, cita el paper seminal histórico indiscutible del autor original del concepto (e.g. Taylor (1993) 'Discretion versus policy rules in practice'; Bollen & Whaley (2004) 'Does Net Buying Pressure Affect the Shape of the Implied Volatility Smile?'; Garleanu, Pedersen & Poteshman (2009) 'Demand-Based Option Pricing'; etc.).
+     e) 'referenceUrl': Enlace directo o de búsqueda académica verificado (Google Scholar, SSRN, NBER, etc.).
 `;
 
       let userPrompt = "";
@@ -751,8 +797,8 @@ ${textToAnalyze}
               properties: {
                 term: { type: Type.STRING, description: "Concepto o término técnico/filosófico/científico." },
                 definition: { type: Type.STRING, description: "Definición accesible, clara y didáctica (nivel universitario)." },
-                simpleExample: { type: Type.STRING, description: "Ejemplo sencillo, intuitivo o cotidiano que ilustra el concepto de manera clara e inmediata." },
-                scientificEvidenceOrSource: { type: Type.STRING, description: "Evidencia empírica, estudio clásico o fuente científica contrastada que demuestra/prueba este concepto." },
+                simpleExample: { type: Type.STRING, description: "Ejemplo o caso práctico sustancial, detallado y rigurosamente documentado (evita metáforas simplistas). Explica cómo opera en la práctica o qué ocurrió históricamente/empíricamente cuando se aplicó o ignoró este concepto en casos reales (p. ej. decisiones de bancos centrales, políticas públicas, experimentos científicos) y qué consecuencias medibles provocó." },
+                scientificEvidenceOrSource: { type: Type.STRING, description: "Evidencia empírica contrastada, estudio seminal o documento institucional contrastado (autores, año, publicación/organismo) donde se verificó y probó este concepto en la realidad y dónde consultarlo." },
                 referenceUrl: { type: Type.STRING, description: "URL de referencia confiable o búsqueda educativa (e.g. Google Scholar, Wikipedia, Stanford Encyclopedia)." }
               },
               required: ["term", "definition", "simpleExample", "referenceUrl"]
@@ -795,7 +841,9 @@ ${textToAnalyze}
           config: {
             systemInstruction: systemInstruction,
             responseMimeType: "application/json",
-            responseSchema: responseSchemaConfig
+            responseSchema: responseSchemaConfig,
+            temperature: 0.4,
+            tools: [{ googleSearch: {} }]
           }
         });
         responseText = response.text || "";
@@ -844,19 +892,22 @@ ${textToAnalyze}
       const sanitizedSources = await verifyAndEnrichBibliographicSources(rawSources, contextKeywords);
 
       const rawGlossary = result.glossary || [];
-      const sanitizedGlossary = rawGlossary.map((g: any) => {
-        let cleanRef = g.referenceUrl || "";
+      const sanitizedGlossary: GlossaryTerm[] = [];
+
+      for (const g of rawGlossary) {
+        const verifiedEv = await verifyGlossaryEvidence(g.scientificEvidenceOrSource, g.term || "", contextKeywords);
+        let cleanRef = verifiedEv.verifiedUrl || g.referenceUrl || "";
         if (!cleanRef || !cleanRef.startsWith("http")) {
           cleanRef = `https://scholar.google.com/scholar?q=${encodeURIComponent(g.term)}`;
         }
-        return {
+        sanitizedGlossary.push({
           term: g.term || "",
           definition: g.definition || "",
           simpleExample: g.simpleExample || "",
-          scientificEvidenceOrSource: g.scientificEvidenceOrSource || undefined,
+          scientificEvidenceOrSource: verifiedEv.evidenceText || g.scientificEvidenceOrSource || undefined,
           referenceUrl: cleanRef
-        };
-      });
+        });
+      }
 
       const isDoc = documentNames.length > 0;
       const isPhoto = imageList.length > 0 && documentNames.length === 0;
