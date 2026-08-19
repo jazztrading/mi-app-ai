@@ -75,6 +75,12 @@ export interface BibliographicSource {
   openAccessUrl?: string;
 }
 
+interface NumericalExample {
+  concept: string;
+  figureOrCost: string;
+  explanation: string;
+}
+
 interface AnalysisResult {
   id: string;
   url: string;
@@ -85,6 +91,7 @@ interface AnalysisResult {
   translation?: string;
   executiveSummary: string;
   keyPoints: string[];
+  numericalExamples?: NumericalExample[];
   academicDebates?: string;
   criticalPositions?: CriticalPosition[];
   constructiveDebatesSummary?: ConstructiveDebatesSummary;
@@ -94,6 +101,7 @@ interface AnalysisResult {
   contentType: "blog" | "podcast" | "youtube" | "manual" | "photo" | "document";
   photoUrls?: string[];
   fileNames?: string[];
+  overallReliabilityScore?: number;
 }
 
 // Helper functions for persistent database
@@ -322,6 +330,75 @@ async function verifyGlossaryEvidence(
 
 // Cache database loaded from disk
 const db: Record<string, AnalysisResult> = loadDatabase();
+
+function cleanJsonParse(text: string): any {
+  let cleaned = text.trim();
+  if (cleaned.startsWith("```json")) {
+    cleaned = cleaned.replace(/^```json\s*/, "").replace(/\s*```$/, "");
+  } else if (cleaned.startsWith("```")) {
+    cleaned = cleaned.replace(/^```\s*/, "").replace(/\s*```$/, "");
+  }
+  return JSON.parse(cleaned);
+}
+
+async function generateAnalysisContentWithRetry(
+  genContents: any,
+  systemInstruction: string,
+  responseSchemaConfig: any
+): Promise<string> {
+  // Strategy: Try standard gemini-3.7-flash, and fall back to gemini-3.1-flash-lite if quotas or rate limits occur
+  const models = ["gemini-3.7-flash", "gemini-3.1-flash-lite"];
+  let lastError: any = null;
+
+  for (const model of models) {
+    const searchOptions = [{ tools: [{ googleSearch: {} }] }, { tools: undefined }];
+
+    for (const searchOption of searchOptions) {
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          console.log(`[Gemini Analysis] Calling ${model} (attempt ${attempt}, search: ${searchOption.tools ? 'enabled' : 'disabled'})...`);
+
+          const config: any = {
+            systemInstruction,
+            responseMimeType: "application/json",
+            responseSchema: responseSchemaConfig,
+            temperature: 0.4,
+          };
+          if (searchOption.tools) {
+            config.tools = searchOption.tools;
+          }
+
+          const response = await ai.models.generateContent({
+            model,
+            contents: genContents,
+            config
+          });
+
+          const rawText = response.text ? response.text.trim() : "";
+          if (rawText) {
+            return rawText;
+          }
+        } catch (err: any) {
+          lastError = err;
+          const errMsg = err?.message || String(err);
+          console.warn(`[Gemini Analysis Warning] ${model} attempt ${attempt} failed:`, errMsg);
+
+          const is429 = errMsg.includes("429") || errMsg.includes("RESOURCE_EXHAUSTED") || errMsg.includes("rate-limits");
+          if (is429) {
+            // Wait 2-3 seconds with backoff before retry
+            await new Promise((r) => setTimeout(r, 2000 + Math.random() * 800));
+            continue;
+          } else {
+            // Non-rate limit (e.g. search tool or schema issue), jump to next config
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  throw lastError || new Error("No se pudo obtener respuesta del modelo de IA tras varios intentos.");
+}
 
 async function startServer() {
   const app = express();
@@ -621,7 +698,7 @@ async function startServer() {
               bodyText = `Descripción del artículo: ${ogDesc}\n\n${bodyText}`;
             }
 
-            textToAnalyze = bodyText.substring(0, 30000);
+            textToAnalyze = bodyText.substring(0, 16000);
           }
         } catch (scrapeErr: any) {
           console.error("Error scraping URL, will rely on prompt context:", scrapeErr);
@@ -835,18 +912,11 @@ ${textToAnalyze}
           ? { parts: [...contentParts, { text: userPrompt }] }
           : userPrompt;
 
-        const response = await ai.models.generateContent({
-          model: "gemini-3.6-flash",
-          contents: genContents as any,
-          config: {
-            systemInstruction: systemInstruction,
-            responseMimeType: "application/json",
-            responseSchema: responseSchemaConfig,
-            temperature: 0.4,
-            tools: [{ googleSearch: {} }]
-          }
-        });
-        responseText = response.text || "";
+        responseText = await generateAnalysisContentWithRetry(
+          genContents,
+          systemInstruction,
+          responseSchemaConfig
+        );
       } catch (genErr: any) {
         console.error("Gemini generation error:", genErr);
         throw genErr;
@@ -856,7 +926,7 @@ ${textToAnalyze}
         throw new Error("No se obtuvo respuesta del modelo de Inteligencia Artificial.");
       }
 
-      const result = JSON.parse(responseText.trim());
+      const result = cleanJsonParse(responseText);
 
       const contextKeywords = [result.originalTitle || title, ...(result.categories || [])].filter(Boolean).join(" ");
 
@@ -912,6 +982,11 @@ ${textToAnalyze}
       const isDoc = documentNames.length > 0;
       const isPhoto = imageList.length > 0 && documentNames.length === 0;
 
+      // Calculate overall average reliability score
+      const overallReliabilityScore = sanitizedSources.length > 0
+        ? Math.round(sanitizedSources.reduce((acc, s) => acc + (s.reliabilityScore || 80), 0) / sanitizedSources.length)
+        : 88;
+
       // Construct the final analysis structure
       const analysisId = "analysis_" + Date.now();
       const analysis: AnalysisResult = {
@@ -924,6 +999,7 @@ ${textToAnalyze}
         translation: result.translation || undefined,
         executiveSummary: result.executiveSummary || "",
         keyPoints: result.keyPoints || [],
+        numericalExamples: result.numericalExamples || [],
         criticalPositions: sanitizedCriticalPositions,
         constructiveDebatesSummary: result.constructiveDebatesSummary || undefined,
         academicDebates: result.academicDebates || "",
@@ -932,7 +1008,8 @@ ${textToAnalyze}
         analyzedAt: new Date().toISOString(),
         contentType: isDoc ? "document" : (isPhoto ? "photo" : (contentType || "blog")),
         photoUrls: imageList.length > 0 ? imageList : undefined,
-        fileNames: documentNames.length > 0 ? documentNames : undefined
+        fileNames: documentNames.length > 0 ? documentNames : undefined,
+        overallReliabilityScore: overallReliabilityScore
       };
 
       // Save in our persistent database
@@ -945,8 +1022,8 @@ ${textToAnalyze}
       console.error("Error durante el análisis:", err);
       let userErrMsg = err.message || "Error interno del servidor al analizar el contenido.";
       
-      if (userErrMsg.includes("429") || userErrMsg.includes("RESOURCE_EXHAUSTED")) {
-        userErrMsg = "Se ha alcanzado el límite de peticiones por minuto (TPM/RPM) de la cuota gratuita de Gemini API. Por favor, espera 1 minuto antes de volver a pulsar el botón de análisis.";
+      if (userErrMsg.includes("429") || userErrMsg.includes("RESOURCE_EXHAUSTED") || userErrMsg.includes("rate-limits")) {
+        userErrMsg = "Se ha alcanzado temporalmente el límite de peticiones (Rate Limit / Quota) de Gemini API. La plataforma ha intentado recuperar la llamada automáticamente. Por favor, aguarda 30-60 segundos y vuelve a pulsar el botón de análisis.";
       }
 
       res.status(500).json({ error: userErrMsg });

@@ -36,7 +36,8 @@ import {
   Check,
   Download,
   Lightbulb,
-  History
+  History,
+  RotateCcw
 } from "lucide-react";
 import {
   BarChart,
@@ -125,6 +126,7 @@ interface AnalysisResult {
   contentType: "blog" | "podcast" | "youtube" | "manual" | "photo" | "document";
   photoUrls?: string[];
   fileNames?: string[];
+  overallReliabilityScore?: number;
 }
 
 interface UploadedFile {
@@ -904,9 +906,29 @@ export default function App() {
               </button>
 
               {error && (
-                <div className="mt-4 p-3 bg-rose-50 border border-rose-100 rounded-lg text-xs text-rose-700 flex items-start gap-2 animate-fadeIn">
-                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-rose-500" />
-                  <span>{error}</span>
+                <div className="mt-4 p-3.5 bg-rose-50 border border-rose-200 rounded-lg text-xs text-rose-800 space-y-2.5 animate-fadeIn">
+                  <div className="flex items-start gap-2">
+                    <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-rose-600" />
+                    <span className="leading-relaxed">{error}</span>
+                  </div>
+                  <div className="flex items-center justify-end gap-2 pt-1 border-t border-rose-100">
+                    <button
+                      onClick={() => setError(null)}
+                      className="px-2.5 py-1 text-[11px] text-slate-600 hover:text-slate-900 bg-white border border-slate-200 rounded cursor-pointer transition-colors"
+                    >
+                      Cerrar
+                    </button>
+                    <button
+                      onClick={() => {
+                        setError(null);
+                        startAnalysis();
+                      }}
+                      className="px-3 py-1 text-[11px] font-semibold text-white bg-rose-600 hover:bg-rose-700 rounded shadow-2xs cursor-pointer transition-colors flex items-center gap-1"
+                    >
+                      <RotateCcw className="w-3 h-3" />
+                      Reintentar ahora
+                    </button>
+                  </div>
                 </div>
               )}
             </div>
@@ -937,7 +959,9 @@ export default function App() {
                     <span className="text-xs">No hay análisis registrados todavía</span>
                   </div>
                 ) : (
-                  analyses.map((item) => (
+                  analyses.map((item) => {
+                    const itemScore = item.overallReliabilityScore ?? (item.bibliographicSources?.length ? Math.round(item.bibliographicSources.reduce((acc, s) => acc + (s.reliabilityScore || 0), 0) / item.bibliographicSources.length) : 85);
+                    return (
                     <div
                       key={item.id}
                       onClick={() => setSelectedAnalysis(item)}
@@ -964,7 +988,7 @@ export default function App() {
                                 {item.originalLanguage.toUpperCase()}
                               </span>
                               <span className="text-[10px] font-mono text-slate-500 bg-slate-100 px-1.5 py-0.2 rounded-full font-medium">
-                                Score: {item.overallReliabilityScore}/100
+                                Score: {itemScore}/100
                               </span>
                             </div>
                           </div>
@@ -1002,8 +1026,9 @@ export default function App() {
                         </button>
                       </div>
                     </div>
-                  ))
-                )}
+                  );
+                })
+              )}
               </div>
             </div>
 
