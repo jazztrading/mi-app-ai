@@ -1,0 +1,6 @@
+{
+  "name": "Lupa Crítica",
+  "description": "Plataforma de análisis crítico, categorización y verificación de fuentes para blogs, podcasts y vídeos.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
