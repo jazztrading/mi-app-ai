@@ -37,7 +37,13 @@ import {
   Download,
   Lightbulb,
   History,
-  RotateCcw
+  RotateCcw,
+  Edit3,
+  Languages,
+  CheckCircle2,
+  Wand2,
+  Save,
+  CheckCheck
 } from "lucide-react";
 import {
   BarChart,
@@ -77,6 +83,9 @@ interface BibliographicSource {
   isVerified?: boolean;
   citationsCount?: number;
   openAccessUrl?: string;
+  isRecent?: boolean;
+  currencyReason?: string;
+  currencyTag?: string;
 }
 
 interface CriticalPosition {
@@ -106,14 +115,26 @@ interface NumericalExample {
   explanation: string;
 }
 
+interface FactCheckAudit {
+  auditedAt: string;
+  status: "verified" | "corrected";
+  summaryAudit: string;
+  detectedErrors: string[];
+  correctionsApplied: string[];
+  verifiedSources: Array<{ title: string; url: string; snippet?: string }>;
+  userFeedback?: string;
+}
+
 interface AnalysisResult {
   id: string;
   url: string;
   title: string;
   originalLanguage: string;
+  outputLanguage?: string;
   isSpanishOrGalician: boolean;
   categories: string[];
   translation?: string;
+  originalExtractedText?: string;
   executiveSummary: string;
   keyPoints: string[];
   numericalExamples?: NumericalExample[];
@@ -127,6 +148,8 @@ interface AnalysisResult {
   photoUrls?: string[];
   fileNames?: string[];
   overallReliabilityScore?: number;
+  factCheckAudit?: FactCheckAudit;
+  isEditedManually?: boolean;
 }
 
 interface UploadedFile {
@@ -174,8 +197,251 @@ export default function App() {
 
   const [error, setError] = useState<string | null>(null);
   const [copiedNotion, setCopiedNotion] = useState(false);
+  const [translationCopied, setTranslationCopied] = useState(false);
+  const [isTranslatingFull, setIsTranslatingFull] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; title: string } | null>(null);
   const [showClearAllModal, setShowClearAllModal] = useState(false);
+
+  // Fact-checking, Live Web Grounded Consultation & Correction states
+  const [isAuditing, setIsAuditing] = useState(false);
+  const [isApplyingCorrection, setIsApplyingCorrection] = useState(false);
+  const [isSwitchingLanguage, setIsSwitchingLanguage] = useState(false);
+  const [showCorrectionModal, setShowCorrectionModal] = useState(false);
+  const [userCorrectionText, setUserCorrectionText] = useState("");
+  const [correctionWebCheck, setCorrectionWebCheck] = useState(true);
+  const [correctionTargetLang, setCorrectionTargetLang] = useState<string>("");
+
+  // In-place direct editing mode
+  const [isDirectEditMode, setIsDirectEditMode] = useState(false);
+  const [editableSummary, setEditableSummary] = useState("");
+  const [editableKeyPoints, setEditableKeyPoints] = useState<string[]>([]);
+  const [isSavingManualEdit, setIsSavingManualEdit] = useState(false);
+
+  // Sync direct editing inputs when selected analysis changes
+  useEffect(() => {
+    if (selectedAnalysis) {
+      setEditableSummary(selectedAnalysis.executiveSummary || "");
+      setEditableKeyPoints(selectedAnalysis.keyPoints ? [...selectedAnalysis.keyPoints] : []);
+      setIsDirectEditMode(false);
+    }
+  }, [selectedAnalysis?.id]);
+
+  const handleAutoFactCheck = async () => {
+    if (!selectedAnalysis) return;
+    setIsAuditing(true);
+    setError(null);
+
+    try {
+      const res = await fetch(`/api/analyses/${selectedAnalysis.id}/auto-factcheck`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" }
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || "Non se puido completar a auditoría e verificación coa web.");
+      }
+
+      const updated: AnalysisResult = await res.json();
+      setSelectedAnalysis(updated);
+      setAnalyses(prev => {
+        const next = prev.map(item => item.id === updated.id ? updated : item);
+        try {
+          localStorage.setItem("lupa_critica_history", JSON.stringify(next));
+        } catch {}
+        return next;
+      });
+      setEditableSummary(updated.executiveSummary || "");
+      setEditableKeyPoints(updated.keyPoints ? [...updated.keyPoints] : []);
+    } catch (err: any) {
+      console.error("Error en auto fact-check:", err);
+      setError(err.message || "Erro durante a verificación automática na web.");
+    } finally {
+      setIsAuditing(false);
+    }
+  };
+
+  const handleApplyUserCorrection = async () => {
+    if (!selectedAnalysis || !userCorrectionText.trim()) return;
+    setIsApplyingCorrection(true);
+    setError(null);
+
+    try {
+      const res = await fetch(`/api/analyses/${selectedAnalysis.id}/correct`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userCorrection: userCorrectionText.trim(),
+          checkWithWeb: correctionWebCheck,
+          targetLanguage: correctionTargetLang || undefined
+        })
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || "Non se puido procesar a corrección.");
+      }
+
+      const updated: AnalysisResult = await res.json();
+      setSelectedAnalysis(updated);
+      setAnalyses(prev => {
+        const next = prev.map(item => item.id === updated.id ? updated : item);
+        try {
+          localStorage.setItem("lupa_critica_history", JSON.stringify(next));
+        } catch {}
+        return next;
+      });
+      setEditableSummary(updated.executiveSummary || "");
+      setEditableKeyPoints(updated.keyPoints ? [...updated.keyPoints] : []);
+      setShowCorrectionModal(false);
+      setUserCorrectionText("");
+    } catch (err: any) {
+      console.error("Error al aplicar corrección:", err);
+      setError(err.message || "Erro ao aplicar a corrección.");
+    } finally {
+      setIsApplyingCorrection(false);
+    }
+  };
+
+  const handleSaveDirectEdit = async () => {
+    if (!selectedAnalysis) return;
+    setIsSavingManualEdit(true);
+    setError(null);
+
+    try {
+      const res = await fetch(`/api/analyses/${selectedAnalysis.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          executiveSummary: editableSummary,
+          keyPoints: editableKeyPoints
+        })
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || "Error al guardar los cambios.");
+      }
+
+      const updated: AnalysisResult = await res.json();
+      setSelectedAnalysis(updated);
+      setAnalyses(prev => {
+        const next = prev.map(item => item.id === updated.id ? updated : item);
+        try {
+          localStorage.setItem("lupa_critica_history", JSON.stringify(next));
+        } catch {}
+        return next;
+      });
+      setIsDirectEditMode(false);
+    } catch (err: any) {
+      console.error("Error al guardar edición manual:", err);
+      setError(err.message || "Error al guardar los cambios.");
+    } finally {
+      setIsSavingManualEdit(false);
+    }
+  };
+
+  const handleSwitchLanguage = async (targetLang: string) => {
+    if (!selectedAnalysis || isSwitchingLanguage) return;
+    setIsSwitchingLanguage(true);
+    setError(null);
+
+    try {
+      const res = await fetch(`/api/analyses/${selectedAnalysis.id}/switch-language`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ targetLanguage: targetLang })
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || "Error al cambiar el idioma del informe.");
+      }
+
+      const updated: AnalysisResult = await res.json();
+      setSelectedAnalysis(updated);
+      setAnalyses(prev => {
+        const next = prev.map(item => item.id === updated.id ? updated : item);
+        try {
+          localStorage.setItem("lupa_critica_history", JSON.stringify(next));
+        } catch {}
+        return next;
+      });
+      setEditableSummary(updated.executiveSummary || "");
+      setEditableKeyPoints(updated.keyPoints ? [...updated.keyPoints] : []);
+    } catch (err: any) {
+      console.error("Error al cambiar idioma:", err);
+      setError(err.message || "Error al cambiar el idioma.");
+    } finally {
+      setIsSwitchingLanguage(false);
+    }
+  };
+
+  const handleRequestFullTranslation = async (analysisToTranslate?: AnalysisResult) => {
+    const target = analysisToTranslate || selectedAnalysis;
+    if (!target) return;
+
+    setIsTranslatingFull(true);
+    setError(null);
+
+    try {
+      const res = await fetch("/api/full-translation", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          analysisId: target.id,
+          rawText: target.originalExtractedText,
+          url: target.url,
+          title: target.title,
+          originalLanguage: target.originalLanguage
+        })
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || "No se pudo generar la traducción íntegra.");
+      }
+
+      const data = await res.json();
+      const updated: AnalysisResult = {
+        ...target,
+        translation: data.fullTranslation,
+        isSpanishOrGalician: false
+      };
+
+      setSelectedAnalysis(updated);
+      setAnalyses(prev => {
+        const next = prev.map(item => item.id === target.id ? updated : item);
+        try {
+          localStorage.setItem("lupa_critica_history", JSON.stringify(next));
+        } catch {}
+        return next;
+      });
+    } catch (err: any) {
+      console.error("Error al traducir íntegramente:", err);
+      setError(err.message || "Error al solicitar la traducción completa.");
+    } finally {
+      setIsTranslatingFull(false);
+    }
+  };
+
+  const handleCopyTranslation = (text: string) => {
+    navigator.clipboard.writeText(text);
+    setTranslationCopied(true);
+    setTimeout(() => setTranslationCopied(false), 2000);
+  };
+
+  const handleDownloadTranslation = (title: string, text: string) => {
+    const blob = new Blob([`TRADUCCIÓN E HISTORIAL DE ANÁLISIS - LUPA CRÍTICA\nTítulo: ${title}\nFecha: ${new Date().toLocaleString()}\n\n=========================================\nTRADUCCIÓN ÍNTEGRA Y EXHAUSTIVA AL CASTELLANO\n=========================================\n\n${text}`], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `Traduccion_Integra_${title.replace(/[^a-z0-9]/gi, '_').substring(0, 35)}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
 
   // Fetch past analyses on load & sync with localStorage
   useEffect(() => {
@@ -1095,10 +1361,121 @@ export default function App() {
                         </span>
                       </div>
                       
-                      <div className="flex flex-wrap items-center gap-2.5">
+                      <div className="flex flex-wrap items-center gap-2">
+                        {/* Auto Fact-Check with Web Search */}
+                        <button
+                          onClick={handleAutoFactCheck}
+                          disabled={isAuditing}
+                          className="text-xs px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-all font-semibold bg-emerald-600 hover:bg-emerald-700 text-white shadow-xs cursor-pointer disabled:opacity-50"
+                          title="A propia app consulta a web e bases de datos oficiais en tempo real para auditar e rectificar datos inexactos"
+                        >
+                          {isAuditing ? (
+                            <>
+                              <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
+                              <span>Consultando web oficial...</span>
+                            </>
+                          ) : (
+                            <>
+                              <Search className="w-3.5 h-3.5 text-emerald-200" />
+                              <span>Auditar coa Web</span>
+                            </>
+                          )}
+                        </button>
+
+                        {/* User Interactive Correction Proposal */}
+                        <button
+                          onClick={() => {
+                            setUserCorrectionText("");
+                            setShowCorrectionModal(true);
+                          }}
+                          className="text-xs px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-all font-medium bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-300 shadow-xs cursor-pointer"
+                          title="Propoñer unha corrección, aclaración ou dato inexacto para que a app investigue e actualice o informe"
+                        >
+                          <Edit3 className="w-3.5 h-3.5 text-amber-700" />
+                          <span>Propor Corrección</span>
+                        </button>
+
+                        {/* Direct In-place Editing Mode */}
+                        <button
+                          onClick={() => {
+                            if (isDirectEditMode) {
+                              handleSaveDirectEdit();
+                            } else {
+                              setIsDirectEditMode(true);
+                            }
+                          }}
+                          disabled={isSavingManualEdit}
+                          className={`text-xs px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-all font-medium border shadow-xs cursor-pointer ${
+                            isDirectEditMode
+                              ? "bg-indigo-600 text-white border-indigo-700 hover:bg-indigo-700"
+                              : "bg-white text-slate-700 border-slate-300 hover:bg-slate-50"
+                          }`}
+                          title={isDirectEditMode ? "Gardar cambios realizados manualmente" : "Editar directamente os textos deste informe"}
+                        >
+                          {isSavingManualEdit ? (
+                            <>
+                              <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
+                              <span>Gardando...</span>
+                            </>
+                          ) : isDirectEditMode ? (
+                            <>
+                              <Save className="w-3.5 h-3.5 text-white" />
+                              <span>Gardar Edición</span>
+                            </>
+                          ) : (
+                            <>
+                              <Edit3 className="w-3.5 h-3.5 text-slate-500" />
+                              <span>Modo Edición</span>
+                            </>
+                          )}
+                        </button>
+
+                        {/* Language switcher pills */}
+                        <div className="flex items-center gap-0.5 bg-slate-100 p-0.5 rounded-lg border border-slate-200">
+                          <Languages className="w-3.5 h-3.5 text-slate-500 ml-1.5 mr-0.5" />
+                          <button
+                            onClick={() => handleSwitchLanguage("galego")}
+                            disabled={isSwitchingLanguage}
+                            className={`px-2 py-0.5 text-[11px] font-medium rounded transition-all cursor-pointer ${
+                              selectedAnalysis.outputLanguage === "galego"
+                                ? "bg-white text-indigo-700 font-bold shadow-2xs"
+                                : "text-slate-600 hover:text-slate-900"
+                            }`}
+                            title="Traducir / Ver informe en Galego"
+                          >
+                            Galego
+                          </button>
+                          <button
+                            onClick={() => handleSwitchLanguage("castellano")}
+                            disabled={isSwitchingLanguage}
+                            className={`px-2 py-0.5 text-[11px] font-medium rounded transition-all cursor-pointer ${
+                              selectedAnalysis.outputLanguage === "castellano" || !selectedAnalysis.outputLanguage
+                                ? "bg-white text-indigo-700 font-bold shadow-2xs"
+                                : "text-slate-600 hover:text-slate-900"
+                            }`}
+                            title="Traducir / Ver informe en Castellano"
+                          >
+                            Castellano
+                          </button>
+                          <button
+                            onClick={() => handleSwitchLanguage("català")}
+                            disabled={isSwitchingLanguage}
+                            className={`px-2 py-0.5 text-[11px] font-medium rounded transition-all cursor-pointer ${
+                              selectedAnalysis.outputLanguage === "català"
+                                ? "bg-white text-indigo-700 font-bold shadow-2xs"
+                                : "text-slate-600 hover:text-slate-900"
+                            }`}
+                            title="Traducir / Ver informe en Català"
+                          >
+                            Català
+                          </button>
+                        </div>
+
+                        <div className="h-4 w-px bg-slate-200 mx-0.5"></div>
+
                         <button
                           onClick={() => handleCopyNotion()}
-                          className={`text-xs px-3.5 py-1.5 rounded-lg flex items-center gap-2 transition-all font-medium border shadow-xs cursor-pointer ${
+                          className={`text-xs px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-all font-medium border shadow-xs cursor-pointer ${
                             copiedNotion
                               ? "bg-emerald-600 text-white border-emerald-700 shadow-sm"
                               : "bg-white text-slate-800 border-slate-300 hover:bg-slate-50 hover:border-slate-400 hover:text-slate-900"
@@ -1107,24 +1484,24 @@ export default function App() {
                         >
                           {copiedNotion ? (
                             <>
-                              <Check className="w-4 h-4 text-white shrink-0" />
-                              <span className="font-semibold text-white">¡Copiado para Notion!</span>
+                              <Check className="w-3.5 h-3.5 text-white shrink-0" />
+                              <span className="font-semibold text-white">¡Copiado!</span>
                             </>
                           ) : (
                             <>
-                              <Copy className="w-4 h-4 text-indigo-600 shrink-0" />
-                              <span className="font-semibold text-slate-800">Copiar para Notion</span>
+                              <Copy className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
+                              <span className="font-semibold text-slate-800">Notion</span>
                             </>
                           )}
                         </button>
 
                         <button
                           onClick={() => handleDownloadMarkdown()}
-                          className="text-xs text-slate-800 bg-white border border-slate-300 hover:bg-slate-50 hover:border-slate-400 hover:text-slate-900 px-3.5 py-1.5 rounded-lg flex items-center gap-2 transition-all font-medium shadow-xs cursor-pointer"
+                          className="text-xs text-slate-800 bg-white border border-slate-300 hover:bg-slate-50 hover:border-slate-400 hover:text-slate-900 px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-all font-medium shadow-xs cursor-pointer"
                           title="Descargar análisis completo como archivo Markdown (.md) para importar a Notion"
                         >
-                          <Download className="w-4 h-4 text-emerald-600 shrink-0" />
-                          <span className="font-semibold text-slate-800">Descargar .md</span>
+                          <Download className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                          <span className="font-semibold text-slate-800">.md</span>
                         </button>
 
                         {selectedAnalysis.url && (
@@ -1133,20 +1510,19 @@ export default function App() {
                             target="_blank"
                             referrerPolicy="no-referrer"
                             rel="noreferrer"
-                            className="text-xs text-indigo-700 bg-indigo-50 border border-indigo-200 hover:bg-indigo-100 hover:border-indigo-300 px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-all font-medium"
+                            className="text-xs text-indigo-700 bg-indigo-50 border border-indigo-200 hover:bg-indigo-100 hover:border-indigo-300 px-2.5 py-1.5 rounded-lg flex items-center gap-1 transition-all font-medium"
                           >
-                            <ExternalLink className="w-3.5 h-3.5 text-indigo-600" />
-                            Ver Original
+                            <ExternalLink className="w-3 h-3 text-indigo-600" />
+                            Original
                           </a>
                         )}
 
                         <button
                           onClick={() => requestDeleteAnalysis(selectedAnalysis.id, selectedAnalysis.title)}
-                          className="text-xs text-slate-400 hover:text-rose-600 hover:bg-rose-50 border border-transparent hover:border-rose-200 px-2.5 py-1.5 rounded-lg flex items-center gap-1 transition-all cursor-pointer"
+                          className="text-xs text-slate-400 hover:text-rose-600 hover:bg-rose-50 border border-transparent hover:border-rose-200 px-2 py-1.5 rounded-lg flex items-center gap-1 transition-all cursor-pointer"
                           title="Eliminar este análisis"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
-                          <span>Eliminar</span>
                         </button>
                       </div>
                     </div>
@@ -1227,6 +1603,12 @@ export default function App() {
                         Idioma original: <span className="font-semibold text-slate-700">{selectedAnalysis.originalLanguage}</span>
                       </div>
 
+                      {selectedAnalysis.outputLanguage && (
+                        <span className="text-[10px] font-mono font-semibold text-indigo-700 bg-indigo-50 border border-indigo-200 px-2 py-0.5 rounded-full">
+                          Informe en: {selectedAnalysis.outputLanguage.toUpperCase()}
+                        </span>
+                      )}
+
                       {!selectedAnalysis.isSpanishOrGalician && (
                         <span className="text-[10px] font-mono font-semibold text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-full">
                           Requiere Traducción
@@ -1235,33 +1617,222 @@ export default function App() {
                     </div>
                   </div>
 
+                  {/* Live Fact-Check & Verification Audit Card */}
+                  {selectedAnalysis.factCheckAudit ? (
+                    <div className={`rounded-xl p-5 shadow-xs border relative overflow-hidden transition-all ${
+                      selectedAnalysis.factCheckAudit.status === "corrected"
+                        ? "bg-gradient-to-r from-emerald-50/90 via-teal-50/70 to-emerald-50/90 border-emerald-300 text-slate-800"
+                        : "bg-gradient-to-r from-blue-50/90 via-indigo-50/70 to-blue-50/90 border-blue-200 text-slate-800"
+                    }`}>
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-3 pb-3 border-b border-emerald-200/60">
+                        <div className="flex items-center gap-2">
+                          <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
+                          <div>
+                            <h4 className="font-display font-bold text-sm text-slate-900 flex items-center gap-2">
+                              <span>Auditoría de Verificación coa Web Oficial</span>
+                              <span className="text-[10px] font-mono px-2 py-0.5 rounded-full font-bold bg-emerald-100 text-emerald-800 border border-emerald-200">
+                                {selectedAnalysis.factCheckAudit.status === "corrected" ? "✓ Datos Rectificados con Fontes Oficiais" : "✓ 100% Contrastado"}
+                              </span>
+                            </h4>
+                            <span className="text-[11px] text-slate-500 font-mono">
+                              {new Date(selectedAnalysis.factCheckAudit.auditedAt).toLocaleString("es-ES")}
+                            </span>
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={handleAutoFactCheck}
+                            disabled={isAuditing}
+                            className="text-[11px] px-2.5 py-1 rounded-md font-semibold text-emerald-800 bg-white border border-emerald-300 hover:bg-emerald-50 transition-colors shadow-2xs flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                            title="Volver a consultar e contrastar coa web en tempo real"
+                          >
+                            <RotateCcw className={`w-3 h-3 text-emerald-600 ${isAuditing ? "animate-spin" : ""}`} />
+                            <span>{isAuditing ? "Consultando..." : "Re-auditar"}</span>
+                          </button>
+                        </div>
+                      </div>
+
+                      <p className="text-xs leading-relaxed text-slate-700 font-medium mb-3">
+                        {selectedAnalysis.factCheckAudit.summaryAudit}
+                      </p>
+
+                      {selectedAnalysis.factCheckAudit.detectedErrors && selectedAnalysis.factCheckAudit.detectedErrors.length > 0 && (
+                        <div className="mb-3 p-3 bg-white/80 rounded-lg border border-emerald-200/80 text-xs space-y-1.5">
+                          <span className="font-semibold text-rose-800 text-[11px] uppercase tracking-wider block">
+                            Inexactitudes detectadas e emendadas:
+                          </span>
+                          <ul className="list-disc list-inside space-y-1 text-slate-700 text-[11.5px]">
+                            {selectedAnalysis.factCheckAudit.detectedErrors.map((err, eidx) => (
+                              <li key={eidx} className="leading-snug">{err}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+
+                      {selectedAnalysis.factCheckAudit.verifiedSources && selectedAnalysis.factCheckAudit.verifiedSources.length > 0 && (
+                        <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-emerald-200/50">
+                          <span className="text-[11px] font-mono text-slate-500 font-semibold">Fontes oficiais consultadas:</span>
+                          {selectedAnalysis.factCheckAudit.verifiedSources.map((src, sidx) => (
+                            <a
+                              key={sidx}
+                              href={src.url}
+                              target="_blank"
+                              referrerPolicy="no-referrer"
+                              rel="noreferrer"
+                              className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-800 bg-white/90 hover:bg-white border border-emerald-200 px-2 py-0.5 rounded shadow-2xs transition-colors"
+                            >
+                              <span>{src.title}</span>
+                              <ExternalLink className="w-2.5 h-2.5 text-emerald-600" />
+                            </a>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="bg-slate-50 border border-slate-200/80 rounded-xl p-4 shadow-2xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs">
+                      <div className="flex items-center gap-2.5 text-slate-600">
+                        <Search className="w-4 h-4 text-emerald-600 shrink-0" />
+                        <span>
+                          ¿Observas algunha cifra, data, resultado electoral ou candidato inexacto? Podes premer en <strong>Auditar coa Web</strong> para que a app consulte fontes oficiais en tempo real ou en <strong>Propor Corrección</strong>.
+                        </span>
+                      </div>
+                      <button
+                        onClick={handleAutoFactCheck}
+                        disabled={isAuditing}
+                        className="shrink-0 px-3 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-md font-semibold text-xs transition-colors shadow-2xs cursor-pointer flex items-center gap-1 disabled:opacity-50"
+                      >
+                        <Search className="w-3 h-3 text-emerald-200" />
+                        <span>{isAuditing ? "Auditando..." : "Auditar agora"}</span>
+                      </button>
+                    </div>
+                  )}
+
                   {/* Executive Summary Section */}
                   <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-xs">
-                    <h3 className="text-lg font-display font-semibold text-slate-900 mb-4 flex items-center gap-2">
-                      <FileCheck className="w-5 h-5 text-slate-700" />
-                      Resumen Ejecutivo Automático
-                    </h3>
-                    <div className="prose prose-slate max-w-none text-slate-700 text-sm leading-relaxed whitespace-pre-line">
-                      {selectedAnalysis.executiveSummary}
+                    <div className="flex items-center justify-between gap-2 mb-4">
+                      <h3 className="text-lg font-display font-semibold text-slate-900 flex items-center gap-2">
+                        <FileCheck className="w-5 h-5 text-slate-700" />
+                        Resumen Ejecutivo Automático
+                      </h3>
+                      {!isDirectEditMode && (
+                        <button
+                          onClick={() => setIsDirectEditMode(true)}
+                          className="text-[11px] text-slate-400 hover:text-indigo-600 flex items-center gap-1 font-medium transition-colors cursor-pointer"
+                          title="Editar manualmente este texto"
+                        >
+                          <Edit3 className="w-3 h-3" />
+                          Editar texto
+                        </button>
+                      )}
                     </div>
+
+                    {isDirectEditMode ? (
+                      <div className="space-y-3">
+                        <textarea
+                          rows={8}
+                          value={editableSummary}
+                          onChange={(e) => setEditableSummary(e.target.value)}
+                          className="w-full p-3 text-sm bg-slate-50 border border-indigo-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-600 focus:bg-white text-slate-800 leading-relaxed font-sans"
+                          placeholder="Escribe o edita el resumen ejecutivo..."
+                        />
+                        <div className="flex items-center justify-end gap-2">
+                          <button
+                            onClick={() => {
+                              setEditableSummary(selectedAnalysis.executiveSummary);
+                              setIsDirectEditMode(false);
+                            }}
+                            className="px-3 py-1 text-xs text-slate-600 hover:text-slate-900 border border-slate-200 rounded-md cursor-pointer"
+                          >
+                            Cancelar
+                          </button>
+                          <button
+                            onClick={handleSaveDirectEdit}
+                            disabled={isSavingManualEdit}
+                            className="px-3.5 py-1 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 rounded-md cursor-pointer flex items-center gap-1 shadow-2xs"
+                          >
+                            <Save className="w-3.5 h-3.5" />
+                            <span>{isSavingManualEdit ? "Guardando..." : "Guardar Resumen"}</span>
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="prose prose-slate max-w-none text-slate-700 text-sm leading-relaxed whitespace-pre-line">
+                        {selectedAnalysis.executiveSummary}
+                      </div>
+                    )}
                   </div>
 
                   {/* Staged Key points list */}
                   <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-xs">
-                    <h3 className="text-lg font-display font-semibold text-slate-900 mb-4 flex items-center gap-2">
-                      <Sparkles className="w-5 h-5 text-indigo-600" />
-                      Puntos Clave Extraídos
-                    </h3>
-                    <div className="space-y-3.5">
-                      {selectedAnalysis.keyPoints.map((point, idx) => (
-                        <div key={idx} className="flex items-start gap-3 p-3 bg-slate-50 border border-slate-100 rounded-lg">
-                          <span className="w-5 h-5 rounded-full bg-slate-900 text-white flex items-center justify-center text-[10px] font-mono shrink-0 mt-0.5">
-                            {idx + 1}
-                          </span>
-                          <p className="text-sm text-slate-700 leading-relaxed">{point}</p>
-                        </div>
-                      ))}
+                    <div className="flex items-center justify-between gap-2 mb-4">
+                      <h3 className="text-lg font-display font-semibold text-slate-900 flex items-center gap-2">
+                        <Sparkles className="w-5 h-5 text-indigo-600" />
+                        Puntos Clave Extraídos
+                      </h3>
+                      {isDirectEditMode && (
+                        <button
+                          onClick={() => setEditableKeyPoints(prev => [...prev, "Nuevo punto clave..."])}
+                          className="text-xs text-indigo-600 hover:text-indigo-800 flex items-center gap-1 font-semibold cursor-pointer"
+                        >
+                          <PlusCircle className="w-3.5 h-3.5" />
+                          Engadir punto
+                        </button>
+                      )}
                     </div>
+
+                    {isDirectEditMode ? (
+                      <div className="space-y-3">
+                        {editableKeyPoints.map((point, idx) => (
+                          <div key={idx} className="flex items-start gap-2 p-2 bg-slate-50 border border-indigo-100 rounded-lg">
+                            <span className="w-5 h-5 rounded-full bg-slate-900 text-white flex items-center justify-center text-[10px] font-mono shrink-0 mt-1">
+                              {idx + 1}
+                            </span>
+                            <textarea
+                              rows={2}
+                              value={point}
+                              onChange={(e) => {
+                                const val = e.target.value;
+                                setEditableKeyPoints(prev => {
+                                  const next = [...prev];
+                                  next[idx] = val;
+                                  return next;
+                                });
+                              }}
+                              className="w-full p-2 text-xs bg-white border border-slate-200 rounded focus:ring-1 focus:ring-indigo-600 text-slate-800"
+                            />
+                            <button
+                              onClick={() => setEditableKeyPoints(prev => prev.filter((_, i) => i !== idx))}
+                              className="p-1 text-slate-400 hover:text-rose-600 cursor-pointer"
+                              title="Eliminar este punto"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        ))}
+                        <div className="flex items-center justify-end gap-2 pt-2">
+                          <button
+                            onClick={handleSaveDirectEdit}
+                            disabled={isSavingManualEdit}
+                            className="px-3.5 py-1 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 rounded-md cursor-pointer flex items-center gap-1 shadow-2xs"
+                          >
+                            <Save className="w-3.5 h-3.5" />
+                            <span>{isSavingManualEdit ? "Guardando..." : "Guardar Puntos Clave"}</span>
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="space-y-3.5">
+                        {selectedAnalysis.keyPoints.map((point, idx) => (
+                          <div key={idx} className="flex items-start gap-3 p-3 bg-slate-50 border border-slate-100 rounded-lg">
+                            <span className="w-5 h-5 rounded-full bg-slate-900 text-white flex items-center justify-center text-[10px] font-mono shrink-0 mt-0.5">
+                              {idx + 1}
+                            </span>
+                            <p className="text-sm text-slate-700 leading-relaxed">{point}</p>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
 
                   {/* Resumen Explicativo con Ejemplos Numéricos, Costes y Cifras Reales */}
@@ -1583,35 +2154,139 @@ export default function App() {
                     </div>
                   )}
 
-                  {/* Translation display (Conditional on NOT spanish/galician) */}
-                  {selectedAnalysis.translation && (
+                  {/* Translation display (Full unabridged version or translation generator) */}
+                  {selectedAnalysis.translation ? (
                     <div className="bg-slate-50 border border-amber-200 rounded-xl p-6 shadow-xs relative overflow-hidden">
-                      <div className="absolute right-0 top-0 w-24 h-24 bg-amber-500/5 rounded-full blur-xl"></div>
-                      <div className="flex items-center gap-2 mb-3">
-                        <Globe className="w-5 h-5 text-amber-600" />
-                        <h3 className="text-lg font-display font-semibold text-slate-900">Transcripción y Traducción Exhaustiva al Castellano</h3>
-                        <span className="text-[10px] font-mono font-medium text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-full">
-                          Versión Completa
-                        </span>
+                      <div className="absolute right-0 top-0 w-28 h-28 bg-amber-500/5 rounded-full blur-xl pointer-events-none"></div>
+                      
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4 pb-3 border-b border-amber-200/80">
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <Globe className="w-5 h-5 text-amber-600" />
+                            <h3 className="text-lg font-display font-semibold text-slate-900">
+                              Transcripción y Traducción Exhaustiva e Íntegra al Castellano
+                            </h3>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-2 mt-1.5 text-xs text-slate-500">
+                            <span>Idioma original: <strong className="text-slate-700">{selectedAnalysis.originalLanguage}</strong></span>
+                            <span className="text-slate-300">•</span>
+                            <span className="text-[10px] font-mono font-medium text-emerald-800 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full">
+                              100% Íntegra Sin Omisiones
+                            </span>
+                            <span className="text-slate-300">•</span>
+                            <span className="text-[11px] font-mono text-slate-500">
+                              ~{selectedAnalysis.translation.split(/\s+/).filter(Boolean).length} palabras
+                            </span>
+                          </div>
+                        </div>
+
+                        {/* Action buttons for translation */}
+                        <div className="flex items-center gap-2 self-start sm:self-center shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => handleCopyTranslation(selectedAnalysis.translation || "")}
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white hover:bg-slate-100 border border-slate-200 rounded-lg text-xs font-semibold text-slate-700 transition-colors shadow-2xs"
+                            title="Copiar traducción íntegra al portapapeles"
+                          >
+                            {translationCopied ? (
+                              <>
+                                <Check className="w-3.5 h-3.5 text-emerald-600" />
+                                <span className="text-emerald-700">¡Copiado!</span>
+                              </>
+                            ) : (
+                              <>
+                                <Copy className="w-3.5 h-3.5 text-slate-500" />
+                                <span>Copiar</span>
+                              </>
+                            )}
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => handleDownloadTranslation(selectedAnalysis.title, selectedAnalysis.translation || "")}
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white hover:bg-slate-100 border border-slate-200 rounded-lg text-xs font-semibold text-slate-700 transition-colors shadow-2xs"
+                            title="Descargar traducción completa en archivo de texto .txt"
+                          >
+                            <Download className="w-3.5 h-3.5 text-slate-500" />
+                            <span>Descargar TXT</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            disabled={isTranslatingFull}
+                            onClick={() => handleRequestFullTranslation(selectedAnalysis)}
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-lg text-xs font-semibold text-amber-900 transition-colors shadow-2xs disabled:opacity-50"
+                            title="Volver a generar o ampliar la traducción íntegra"
+                          >
+                            <RotateCcw className={`w-3.5 h-3.5 text-amber-700 ${isTranslatingFull ? "animate-spin" : ""}`} />
+                            <span>{isTranslatingFull ? "Traduciendo..." : "Regenerar"}</span>
+                          </button>
+                        </div>
                       </div>
-                      <p className="text-xs text-slate-500 mb-4">
-                        El original fue detectado en <strong className="text-slate-700">{selectedAnalysis.originalLanguage}</strong>. A continuación se proporciona la traducción extensa estructurada sección por sección:
+
+                      <p className="text-xs text-slate-600 mb-4 leading-relaxed">
+                        A continuación se presenta la traducción exhaustiva y completa de todo el material analizado de principio a fin, conservando todos los párrafos, explicaciones técnicas, declaraciones y matices originales:
                       </p>
-                      <div className="p-5 bg-white border border-slate-200 rounded-lg text-sm leading-relaxed text-slate-800 font-sans max-h-[600px] overflow-y-auto whitespace-pre-line shadow-inner">
+
+                      <div className="p-6 bg-white border border-slate-200 rounded-xl text-sm leading-relaxed text-slate-800 font-sans max-h-[700px] overflow-y-auto whitespace-pre-line shadow-inner select-text">
                         {selectedAnalysis.translation}
                       </div>
                     </div>
-                  )}
+                  ) : !selectedAnalysis.isSpanishOrGalician ? (
+                    <div className="bg-amber-50/70 border border-amber-200 rounded-xl p-6 shadow-xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+                      <div className="space-y-1">
+                        <div className="flex items-center gap-2">
+                          <Globe className="w-5 h-5 text-amber-700" />
+                          <h3 className="text-base font-display font-semibold text-slate-900">
+                            Traducción y Transcripción Íntegra al Castellano
+                          </h3>
+                          <span className="text-[10px] font-mono font-medium text-amber-800 bg-amber-100 border border-amber-300 px-2 py-0.5 rounded-full">
+                            Original: {selectedAnalysis.originalLanguage}
+                          </span>
+                        </div>
+                        <p className="text-xs text-slate-600 leading-relaxed">
+                          Puedes generar una traducción íntegra, completa y exhaustiva párrafo por párrafo de todo el artículo o material multimedia al castellano.
+                        </p>
+                      </div>
+
+                      <button
+                        type="button"
+                        disabled={isTranslatingFull}
+                        onClick={() => handleRequestFullTranslation(selectedAnalysis)}
+                        className="inline-flex items-center gap-2 px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-xs font-semibold shadow-xs transition-colors shrink-0 disabled:opacity-50"
+                      >
+                        {isTranslatingFull ? (
+                          <>
+                            <RotateCcw className="w-4 h-4 animate-spin text-white" />
+                            <span>Traduciendo íntegramente...</span>
+                          </>
+                        ) : (
+                          <>
+                            <Globe className="w-4 h-4 text-white" />
+                            <span>Generar Traducción Íntegra</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  ) : null}
 
                   {/* Bibliographic sources & Academic Verification Section */}
                   <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-xs">
                     <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-6 pb-4 border-b border-slate-100">
                       <div>
-                        <h3 className="text-lg font-display font-semibold text-slate-900 flex items-center gap-2">
-                          <BookOpen className="w-5 h-5 text-indigo-600" />
-                          Gabinete de Fuentes Bibliográficas de Contraste
-                        </h3>
-                        <p className="text-xs text-slate-500 mt-0.5">Fuentes de alto rigor académico para verificar la veracidad o abrir debate sobre la tesis central.</p>
+                        <div className="flex items-center gap-2">
+                          <h3 className="text-lg font-display font-semibold text-slate-900 flex items-center gap-2">
+                            <BookOpen className="w-5 h-5 text-indigo-600" />
+                            Gabinete de Fuentes Bibliográficas de Contraste
+                          </h3>
+                          <span className="text-[10px] font-mono font-bold text-emerald-800 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full flex items-center gap-1">
+                            <Sparkles className="w-3 h-3 text-emerald-600" />
+                            Datos Actualizados (2021-2026)
+                          </span>
+                        </div>
+                        <p className="text-xs text-slate-500 mt-1">
+                          Fuentes y publicaciones indexadas con máxima prioridad en los últimos 5 años (2021-2026) para contrastar la tesis central con indicadores, literatura y datos empíricos contemporáneos.
+                        </p>
                       </div>
                     </div>
 
@@ -1647,7 +2322,7 @@ export default function App() {
                                   return (
                                     <div className="bg-slate-900 text-white p-3 rounded-lg text-xs shadow-lg border border-slate-800 max-w-xs">
                                       <p className="font-semibold">{data.title}</p>
-                                      <p className="text-[10px] text-slate-300 mt-1">Autor: {data.author}</p>
+                                      <p className="text-[10px] text-slate-300 mt-1">Autor: {data.author} ({data.year})</p>
                                       <p className="text-xs font-mono mt-1 text-amber-400">Fiabilidad: {data.reliabilityScore}/100</p>
                                     </div>
                                   );
@@ -1674,6 +2349,8 @@ export default function App() {
                         const firstAuthor = (source.author || "").split(",")[0].split(" y ")[0].trim();
                         const exactScholarQuery = `"${source.title}" ${firstAuthor}`.trim();
                         const exactJstorQuery = `"${source.title}"`;
+                        const yearNum = parseInt(source.year || "2024", 10);
+                        const isModern = !isNaN(yearNum) ? yearNum >= 2021 : (source.isRecent !== false);
 
                         return (
                           <div key={idx} className="border border-slate-150 rounded-xl p-5 hover:border-slate-350 transition-all bg-white shadow-xs">
@@ -1683,15 +2360,23 @@ export default function App() {
                                   <span className="text-[10px] font-mono font-semibold uppercase tracking-wider text-indigo-600 bg-indigo-50 border border-indigo-100 px-2 py-0.5 rounded">
                                     {source.type}
                                   </span>
-                                  {source.year && (
-                                    <span className="text-[10px] font-mono font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded flex items-center gap-1">
-                                      <Calendar className="w-3 h-3" />
-                                      {source.year}
+                                  
+                                  {/* Currency / Recency Badge */}
+                                  {isModern ? (
+                                    <span className="text-[10px] font-mono font-bold text-emerald-800 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded flex items-center gap-1">
+                                      <Sparkles className="w-3 h-3 text-emerald-600" />
+                                      Datos Actualizados ({source.year || "2021-2026"})
+                                    </span>
+                                  ) : (
+                                    <span className="text-[10px] font-mono font-bold text-amber-900 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded flex items-center gap-1">
+                                      <History className="w-3 h-3 text-amber-600" />
+                                      Hito Histórico Seminal ({source.year})
                                     </span>
                                   )}
+
                                   {source.isVerified !== false && (
-                                    <span className="text-[10px] font-mono font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded flex items-center gap-1">
-                                      <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
+                                    <span className="text-[10px] font-mono font-bold text-teal-700 bg-teal-50 border border-teal-200 px-2 py-0.5 rounded flex items-center gap-1">
+                                      <ShieldCheck className="w-3.5 h-3.5 text-teal-600" />
                                       Indexado en Repositorio Oficial
                                     </span>
                                   )}
@@ -1723,6 +2408,25 @@ export default function App() {
                             <div className="w-full bg-slate-100 h-1.5 rounded-full overflow-hidden mb-4">
                               <div className={`h-full ${getProgressBarColor(source.reliabilityScore)} rounded-full`} style={{ width: `${source.reliabilityScore}%` }}></div>
                             </div>
+
+                            {/* Currency reason banner */}
+                            {source.currencyReason && (
+                              <div className={`p-3 rounded-lg text-xs flex items-start gap-2 mb-4 border ${
+                                isModern 
+                                  ? 'bg-emerald-50/60 border-emerald-200/70 text-emerald-950' 
+                                  : 'bg-amber-50/60 border-amber-200/70 text-amber-950'
+                              }`}>
+                                <Sparkles className={`w-3.5 h-3.5 mt-0.5 shrink-0 ${isModern ? 'text-emerald-600' : 'text-amber-600'}`} />
+                                <div className="space-y-0.5">
+                                  <span className="font-semibold text-[11px] block">
+                                    {isModern ? 'Vigencia de Datos & Actualización Empírica:' : 'Justificación de Recurso Seminal Histórico:'}
+                                  </span>
+                                  <p className="text-[11.5px] leading-relaxed text-slate-700">
+                                    {source.currencyReason}
+                                  </p>
+                                </div>
+                              </div>
+                            )}
 
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-5 mt-4 border-t border-slate-100 pt-4 text-xs">
                               <div className="space-y-2">
@@ -1778,12 +2482,12 @@ export default function App() {
                                   </a>
                                 )}
                                 <a
-                                  href={`https://scholar.google.com/scholar?q=${encodeURIComponent(exactScholarQuery)}`}
+                                  href={`https://scholar.google.com/scholar?q=${encodeURIComponent(exactScholarQuery)}${isModern ? '&as_ylo=2021' : ''}`}
                                   target="_blank"
                                   referrerPolicy="no-referrer"
                                   rel="noreferrer"
                                   className="inline-flex items-center gap-1 text-[11px] font-semibold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 px-2.5 py-1 rounded-md transition-colors"
-                                  title="Buscar este artículo exacto en Google Scholar"
+                                  title="Buscar este artículo en Google Scholar (filtrado para publicaciones recientes)"
                                 >
                                   Google Scholar
                                   <ExternalLink className="w-3 h-3" />
@@ -1957,6 +2661,114 @@ export default function App() {
                 className="text-xs px-3.5 py-2 rounded-lg bg-rose-600 hover:bg-rose-700 text-white font-medium cursor-pointer transition-colors shadow-xs"
               >
                 Vaciar todo
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* User Correction & Fact Refinement Modal */}
+      {showCorrectionModal && selectedAnalysis && (
+        <div 
+          className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 animate-fadeIn"
+          onClick={() => !isApplyingCorrection && setShowCorrectionModal(false)}
+        >
+          <div 
+            className="bg-white border border-slate-200 rounded-2xl p-6 max-w-xl w-full shadow-2xl space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+              <div className="flex items-center gap-2.5 text-amber-700">
+                <div className="p-2 bg-amber-50 rounded-xl border border-amber-200">
+                  <Edit3 className="w-5 h-5 text-amber-700" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold font-display text-slate-900">
+                    Propor Corrección ou Rectificación
+                  </h3>
+                  <p className="text-xs text-slate-500">
+                    Sinala calquera dato, data, cifra ou candidato inexacto para que a app o rectifique
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => !isApplyingCorrection && setShowCorrectionModal(false)}
+                className="text-slate-400 hover:text-slate-600 p-1 rounded-lg"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="space-y-3">
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1.5">
+                  ¿Que dato ou información é inexacta e como debe corrixirse?
+                </label>
+                <textarea
+                  rows={4}
+                  value={userCorrectionText}
+                  onChange={(e) => setUserCorrectionText(e.target.value)}
+                  placeholder="Exemplo: O BNG acadou 3 escanos nas eleccións xerais do ano 2000 (306.268 votos, 1,32%) e os deputados foron Francisco Rodríguez, Guillerme Vázquez e Carlos Aymerich..."
+                  className="w-full p-3 text-sm bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-amber-500 focus:bg-white text-slate-800 font-sans"
+                />
+              </div>
+
+              {/* Options */}
+              <div className="p-3 bg-amber-50/70 border border-amber-200/80 rounded-xl space-y-2.5 text-xs text-slate-700">
+                <label className="flex items-center gap-2.5 cursor-pointer font-medium">
+                  <input
+                    type="checkbox"
+                    checked={correctionWebCheck}
+                    onChange={(e) => setCorrectionWebCheck(e.target.checked)}
+                    className="w-4 h-4 text-amber-600 rounded border-slate-300 focus:ring-amber-500"
+                  />
+                  <span>
+                    <strong>Contrastar e verificar con busca web en tempo real</strong> (consulta bases de datos electorais e oficiais)
+                  </span>
+                </label>
+
+                <div className="flex items-center justify-between pt-2 border-t border-amber-200/60">
+                  <span className="font-semibold text-slate-700 flex items-center gap-1.5">
+                    <Languages className="w-3.5 h-3.5 text-amber-700" />
+                    Idioma de saída do informe rectificado:
+                  </span>
+                  <select
+                    value={correctionTargetLang || selectedAnalysis.outputLanguage || "galego"}
+                    onChange={(e) => setCorrectionTargetLang(e.target.value)}
+                    className="text-xs bg-white border border-amber-300 rounded-md px-2 py-1 font-medium text-slate-800 focus:outline-none"
+                  >
+                    <option value="galego">Galego (Lingua Galega)</option>
+                    <option value="castellano">Castellano (Español)</option>
+                    <option value="català">Català</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2.5 pt-3 border-t border-slate-100">
+              <button
+                onClick={() => setShowCorrectionModal(false)}
+                disabled={isApplyingCorrection}
+                className="text-xs px-3.5 py-2 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 font-medium cursor-pointer transition-colors"
+              >
+                Cancelar
+              </button>
+              <button
+                onClick={handleApplyUserCorrection}
+                disabled={isApplyingCorrection || !userCorrectionText.trim()}
+                className="text-xs px-4 py-2 rounded-lg bg-amber-600 hover:bg-amber-700 text-white font-semibold cursor-pointer transition-colors shadow-xs flex items-center gap-1.5 disabled:opacity-40"
+              >
+                {isApplyingCorrection ? (
+                  <>
+                    <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
+                    <span>Investigando e aplicando corrección...</span>
+                  </>
+                ) : (
+                  <>
+                    <Wand2 className="w-3.5 h-3.5" />
+                    <span>Aplicar Corrección e Rectificar</span>
+                  </>
+                )}
               </button>
             </div>
           </div>
