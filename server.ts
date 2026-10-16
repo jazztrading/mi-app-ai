@@ -7,15 +7,24 @@ import dotenv from "dotenv";
 import { createServer as createViteServer } from "vite";
 import mammoth from "mammoth";
 import { PDFParse } from "pdf-parse";
+import {
+  HttpError, MAX_BODY_MB, requireAuth, failedAuthLimiter, apiLimiter, costlyLimiter,
+  securityHeaders, ID_RE, validateAnalyzeBody,
+} from "./server/security";
+import { safeFetch, parseAndValidateUrl, UnsafeUrlError } from "./server/safeFetch";
 
 // Load environment variables
 dotenv.config();
 
-const PORT = 3000;
-const DB_FILE = path.join(process.cwd(), "analyses_db.json");
+const PORT = Number(process.env.PORT) || 3000; // Render inyecta PORT
+const DB_FILE = path.join(process.env.DATA_DIR || process.cwd(), "analyses_db.json");
 
 // Initialize Gemini SDK with recommended user-agent header
 const apiKey = process.env.GEMINI_API_KEY;
+if (!apiKey) {
+  console.error("FATAL: falta GEMINI_API_KEY (defínela como variable de entorno del host, nunca en el repo).");
+  process.exit(1);
+}
 const ai = new GoogleGenAI({
   apiKey: apiKey,
   httpOptions: {
@@ -84,13 +93,23 @@ interface NumericalExample {
   explanation: string;
 }
 
+export interface DataContrastItem {
+  claimOrFact: string;
+  officialVerification: string;
+  status: "verified" | "corrected" | "clarified";
+  reliableSource: string;
+  sourceUrl?: string;
+}
+
 export interface FactCheckAudit {
   auditedAt: string;
   status: "verified" | "corrected";
+  verdictTitle?: string;
   summaryAudit: string;
   detectedErrors: string[];
   correctionsApplied: string[];
-  verifiedSources: Array<{ title: string; url: string; snippet?: string }>;
+  contrastTable?: DataContrastItem[];
+  verifiedSources: Array<{ title: string; url: string; snippet?: string; reliability?: string }>;
   userFeedback?: string;
 }
 
@@ -637,9 +656,24 @@ async function generateGroundedSearchText(
 
 async function startServer() {
   const app = express();
+  app.disable("x-powered-by");
+  app.set("trust proxy", Number(process.env.TRUST_PROXY ?? 1)); // Render está detrás de un proxy
 
-  // Enable JSON body parsing with higher limit for larger files/documents
-  app.use(express.json({ limit: "50mb" }));
+  // Cuerpo JSON acotado (los ficheros viajan en base64)
+  app.use(express.json({ limit: `${MAX_BODY_MB}mb` }));
+  app.use(securityHeaders);
+
+  // Único endpoint público (sin datos): comprobación de salud para Render
+  app.get("/api/health", (_req, res) => res.json({ ok: true }));
+
+  // Todo lo demás bajo /api exige credencial; los intentos fallidos se limitan por IP
+  app.use("/api", failedAuthLimiter, requireAuth, apiLimiter);
+  app.param("id", (_req, _res, next, id) => (ID_RE.test(id) ? next() : next(new HttpError(400, "Identificador no válido."))));
+  // Rutas que consumen cuota de Gemini / OpenAlex / Crossref
+  app.post(
+    ["/api/analyze", "/api/full-translation", "/api/analyses/:id/auto-factcheck", "/api/analyses/:id/correct", "/api/analyses/:id/switch-language"],
+    costlyLimiter
+  );
 
   // API Endpoint to fetch historical analyses
   app.get("/api/analyses", (req, res) => {
@@ -658,9 +692,31 @@ async function startServer() {
 
   // API Endpoint to clear entire history if requested
   app.delete("/api/analyses", (req, res) => {
+    if (req.get("x-confirm-delete-all") !== "yes") {
+      return res.status(400).json({ error: "Borrado masivo: añade la cabecera X-Confirm-Delete-All: yes." });
+    }
     Object.keys(db).forEach((k) => delete db[k]);
     saveDatabase(db);
     res.json({ success: true, message: "Histórico completo vaciado" });
+  });
+
+  // Validación síncrona previa: así el error llega a next() y se responde 400 (Express 4 no captura throws en handlers async)
+  app.post("/api/analyze", (req, _res, next) => {
+    try {
+      validateAnalyzeBody(req.body);
+      if (req.body.url) parseAndValidateUrl(req.body.url); // 400 para localhost, IPs privadas, esquemas no http(s)…
+      next();
+    } catch (e) {
+      next(e);
+    }
+  });
+  app.post("/api/full-translation", (req, _res, next) => {
+    try {
+      if (req.body?.url) parseAndValidateUrl(req.body.url);
+      next();
+    } catch (e) {
+      next(e);
+    }
   });
 
   // Main Analysis Endpoint
@@ -854,7 +910,7 @@ async function startServer() {
               if (pathParts.length > 1) {
                 const slug = pathParts[1].split("/")[0].split("?")[0];
                 const apiUrl = `https://${parsed.host}/api/v1/posts/${slug}`;
-                const subRes = await fetch(apiUrl, {
+                const subRes = await safeFetch(apiUrl, {
                   headers: {
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                     "Accept": "application/json"
@@ -884,13 +940,12 @@ async function startServer() {
           }
 
           if (!scraped) {
-            const response = await fetch(url, {
+            const response = await safeFetch(url, {
               headers: {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
                 "Accept-Language": "es-ES,es;q=0.9,en;q=0.8"
-              },
-              redirect: "follow"
+              }
             });
 
             if (!response.ok) {
@@ -936,6 +991,7 @@ async function startServer() {
             textToAnalyze = bodyText.substring(0, 45000);
           }
         } catch (scrapeErr: any) {
+          if (scrapeErr instanceof UnsafeUrlError) throw scrapeErr; // p. ej. redirección a IP privada → 400
           console.error("Error scraping URL, will rely on prompt context:", scrapeErr);
           textToAnalyze = `Analiza este ensayo o artículo de internet de la URL: ${url}. Título del recurso: ${title || url}`;
         }
@@ -1297,6 +1353,7 @@ ${textToAnalyze}
       res.json(analysis);
 
     } catch (err: any) {
+      if (err instanceof UnsafeUrlError) return res.status(400).json({ error: err.message });
       console.error("Error durante el análisis:", err);
       let userErrMsg = err.message || "Error interno del servidor al analizar el contenido.";
       
@@ -1328,7 +1385,7 @@ ${textToAnalyze}
 
       if (!targetText && url) {
         try {
-          const response = await fetch(url, {
+          const response = await safeFetch(url, {
             headers: {
               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
               "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
@@ -1455,7 +1512,8 @@ Genera un objeto JSON estructurado con la auditoría y la versión completamente
         type: Type.OBJECT,
         properties: {
           status: { type: Type.STRING, description: "'corrected' si se detectaron y corrigieron errores/omisiones; 'verified' si todo era 100% exacto." },
-          summaryAudit: { type: Type.STRING, description: "Explicación detallada de la auditoría y de las rectificaciones efectuadas con datos oficiales (en el idioma del informe)." },
+          verdictTitle: { type: Type.STRING, description: "Título sintético del informe de contraste (en el idioma del informe, p. ej. 'Informe de contraste de datos: Verificación con fontes oficiais')." },
+          summaryAudit: { type: Type.STRING, description: "Informe analítico exhaustivo que contrasta cada dato analizado con las fuentes más fiables posibles (en el idioma del informe)." },
           detectedErrors: { 
             type: Type.ARRAY, 
             items: { type: Type.STRING },
@@ -1465,6 +1523,21 @@ Genera un objeto JSON estructurado con la auditoría y la versión completamente
             type: Type.ARRAY, 
             items: { type: Type.STRING },
             description: "Lista de rectificaciones aplicadas con datos contrastados oficiales."
+          },
+          contrastTable: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                claimOrFact: { type: Type.STRING, description: "El dato, fecha, resultado electoral o afirmación que figuraba inicialmente." },
+                officialVerification: { type: Type.STRING, description: "El dato real y contrastado según las fuentes oficiales y fiables más reputadas." },
+                status: { type: Type.STRING, description: "'corrected' si requirió corrección, 'verified' si era correcto, 'clarified' si fue ampliado o matizado." },
+                reliableSource: { type: Type.STRING, description: "Nombre del organismo oficial o fuente fiable consultada (ej. 'Ministerio del Interior / Archivo Electoral', 'Junta Electoral Central', 'INE', 'BOE/DOG', 'Hemeroteca Oficial')." },
+                sourceUrl: { type: Type.STRING, description: "URL o referencia oficial consultada." }
+              },
+              required: ["claimOrFact", "officialVerification", "status", "reliableSource"]
+            },
+            description: "Matriz comparativa de contraste dato por dato para que el usuario no tenga que buscar las fuentes."
           },
           correctedExecutiveSummary: { type: Type.STRING, description: "Resumen ejecutivo completamente rectificado, exacto, enriquecido y sin falsedades históricas (en el idioma del informe)." },
           correctedKeyPoints: { 
@@ -1508,11 +1581,14 @@ Genera un objeto JSON estructurado con la auditoría y la versión completamente
       analysis.factCheckAudit = {
         auditedAt: new Date().toISOString(),
         status: auditData.status === "verified" ? "verified" : "corrected",
+        verdictTitle: auditData.verdictTitle || (isGal ? "Informe de contraste e verificación con fontes fiables" : "Informe de contraste y verificación con fuentes fiables"),
         summaryAudit: auditData.summaryAudit,
         detectedErrors: auditData.detectedErrors || [],
         correctionsApplied: auditData.correctionsApplied || [],
+        contrastTable: auditData.contrastTable || [],
         verifiedSources: sources.length > 0 ? sources : [
-          { title: "Bases de Datos Oficiales y Archivo Histórico Electoral", url: "https://infoelectoral.interior.gob.es/" }
+          { title: "Bases de Datos Oficiales y Archivo Histórico Electoral (Infoelectoral)", url: "https://infoelectoral.interior.gob.es/", reliability: "Base Oficial del Estado" },
+          { title: "Junta Electoral Central (JEC)", url: "https://www.juntaelectoralcentral.es/", reliability: "Órgano Oficial" }
         ]
       };
 
@@ -1735,6 +1811,16 @@ ${analysis.academicDebates ? `Debates Académicos:\n${analysis.academicDebates}`
       console.error("Error al cambiar idioma:", err);
       res.status(500).json({ error: err.message || "Error al traducir el análisis." });
     }
+  });
+
+  // Manejador central de errores (HttpError, URL no segura, cuerpo demasiado grande, JSON mal formado)
+  app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    if (err instanceof HttpError) return res.status(err.status).json({ error: err.message });
+    if (err instanceof UnsafeUrlError) return res.status(400).json({ error: err.message });
+    if (err?.type === "entity.too.large") return res.status(413).json({ error: `Cuerpo demasiado grande (máx. ${MAX_BODY_MB} MB).` });
+    if (err?.type === "entity.parse.failed") return res.status(400).json({ error: "JSON mal formado." });
+    console.error("Error no controlado:", err);
+    res.status(500).json({ error: "Error interno del servidor." });
   });
 
   // Serve frontend assets
