@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { motion, AnimatePresence } from "motion/react";
+import { apiFetch } from "./api";
 import { 
   FileText, 
   Link, 
@@ -115,13 +116,23 @@ interface NumericalExample {
   explanation: string;
 }
 
+interface DataContrastItem {
+  claimOrFact: string;
+  officialVerification: string;
+  status: "verified" | "corrected" | "clarified";
+  reliableSource: string;
+  sourceUrl?: string;
+}
+
 interface FactCheckAudit {
   auditedAt: string;
   status: "verified" | "corrected";
+  verdictTitle?: string;
   summaryAudit: string;
   detectedErrors: string[];
   correctionsApplied: string[];
-  verifiedSources: Array<{ title: string; url: string; snippet?: string }>;
+  contrastTable?: DataContrastItem[];
+  verifiedSources: Array<{ title: string; url: string; snippet?: string; reliability?: string }>;
   userFeedback?: string;
 }
 
@@ -232,7 +243,7 @@ export default function App() {
     setError(null);
 
     try {
-      const res = await fetch(`/api/analyses/${selectedAnalysis.id}/auto-factcheck`, {
+      const res = await apiFetch(`/api/analyses/${selectedAnalysis.id}/auto-factcheck`, {
         method: "POST",
         headers: { "Content-Type": "application/json" }
       });
@@ -267,7 +278,7 @@ export default function App() {
     setError(null);
 
     try {
-      const res = await fetch(`/api/analyses/${selectedAnalysis.id}/correct`, {
+      const res = await apiFetch(`/api/analyses/${selectedAnalysis.id}/correct`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -309,7 +320,7 @@ export default function App() {
     setError(null);
 
     try {
-      const res = await fetch(`/api/analyses/${selectedAnalysis.id}`, {
+      const res = await apiFetch(`/api/analyses/${selectedAnalysis.id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -347,7 +358,7 @@ export default function App() {
     setError(null);
 
     try {
-      const res = await fetch(`/api/analyses/${selectedAnalysis.id}/switch-language`, {
+      const res = await apiFetch(`/api/analyses/${selectedAnalysis.id}/switch-language`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ targetLanguage: targetLang })
@@ -385,7 +396,7 @@ export default function App() {
     setError(null);
 
     try {
-      const res = await fetch("/api/full-translation", {
+      const res = await apiFetch("/api/full-translation", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -450,7 +461,7 @@ export default function App() {
 
   const fetchAnalyses = async () => {
     try {
-      const res = await fetch("/api/analyses");
+      const res = await apiFetch("/api/analyses");
       if (res.ok) {
         const serverData: AnalysisResult[] = await res.json();
         
@@ -588,7 +599,7 @@ export default function App() {
         images: filesToUse.filter(f => f.type === "image").map(f => f.dataUrl)
       };
 
-      const res = await fetch("/api/analyze", {
+      const res = await apiFetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload)
@@ -661,7 +672,7 @@ export default function App() {
     setDeleteTarget(null);
 
     try {
-      await fetch(`/api/analyses/${id}`, { method: "DELETE" });
+      await apiFetch(`/api/analyses/${id}`, { method: "DELETE" });
     } catch (err) {
       console.error("Error al sincronizar borrado con el servidor:", err);
     }
@@ -673,7 +684,7 @@ export default function App() {
     setShowClearAllModal(false);
     try {
       localStorage.removeItem("lupa_critica_history");
-      await fetch("/api/analyses", { method: "DELETE" });
+      await apiFetch("/api/analyses", { method: "DELETE", headers: { "X-Confirm-Delete-All": "yes" } });
     } catch (err) {
       console.error("Error al vaciar histórico:", err);
     }
@@ -1362,37 +1373,37 @@ export default function App() {
                       </div>
                       
                       <div className="flex flex-wrap items-center gap-2">
-                        {/* Auto Fact-Check with Web Search */}
+                        {/* Auto Fact-Check and Contrast Report with Web Search */}
                         <button
                           onClick={handleAutoFactCheck}
                           disabled={isAuditing}
-                          className="text-xs px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-all font-semibold bg-emerald-600 hover:bg-emerald-700 text-white shadow-xs cursor-pointer disabled:opacity-50"
-                          title="A propia app consulta a web e bases de datos oficiais en tempo real para auditar e rectificar datos inexactos"
+                          className="text-xs px-3.5 py-1.5 rounded-lg flex items-center gap-2 transition-all font-semibold bg-emerald-600 hover:bg-emerald-700 text-white shadow-xs cursor-pointer disabled:opacity-50"
+                          title="A propia app consulta as fontes oficiais máis fiables en tempo real, contrasta cada dato e xera un informe completo sen que teñas que buscalas ti"
                         >
                           {isAuditing ? (
                             <>
                               <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
-                              <span>Consultando web oficial...</span>
+                              <span>Contrastando con fontes oficiais...</span>
                             </>
                           ) : (
                             <>
                               <Search className="w-3.5 h-3.5 text-emerald-200" />
-                              <span>Auditar coa Web</span>
+                              <span>Auditar e Contrastar coa Web</span>
                             </>
                           )}
                         </button>
 
-                        {/* User Interactive Correction Proposal */}
+                        {/* Optional manual nuance / observation */}
                         <button
                           onClick={() => {
                             setUserCorrectionText("");
                             setShowCorrectionModal(true);
                           }}
-                          className="text-xs px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-all font-medium bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-300 shadow-xs cursor-pointer"
-                          title="Propoñer unha corrección, aclaración ou dato inexacto para que a app investigue e actualice o informe"
+                          className="text-xs px-2.5 py-1.5 rounded-lg flex items-center gap-1.5 transition-all font-medium text-slate-600 hover:text-slate-900 bg-slate-100 hover:bg-slate-200 border border-slate-200 shadow-2xs cursor-pointer"
+                          title="Se o desexas, tamén podes achegar un matiz ou dato puntual"
                         >
-                          <Edit3 className="w-3.5 h-3.5 text-amber-700" />
-                          <span>Propor Corrección</span>
+                          <Edit3 className="w-3 h-3 text-slate-500" />
+                          <span>Matiz manual</span>
                         </button>
 
                         {/* Direct In-place Editing Mode */}
@@ -1617,50 +1628,125 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Live Fact-Check & Verification Audit Card */}
+                  {/* Live Fact-Check & Verification Audit Card: Informe de Contraste de Datos */}
                   {selectedAnalysis.factCheckAudit ? (
-                    <div className={`rounded-xl p-5 shadow-xs border relative overflow-hidden transition-all ${
+                    <div className={`rounded-xl p-5 sm:p-6 shadow-sm border relative overflow-hidden transition-all ${
                       selectedAnalysis.factCheckAudit.status === "corrected"
-                        ? "bg-gradient-to-r from-emerald-50/90 via-teal-50/70 to-emerald-50/90 border-emerald-300 text-slate-800"
-                        : "bg-gradient-to-r from-blue-50/90 via-indigo-50/70 to-blue-50/90 border-blue-200 text-slate-800"
+                        ? "bg-gradient-to-br from-emerald-50/95 via-teal-50/80 to-emerald-50/95 border-emerald-300 text-slate-800"
+                        : "bg-gradient-to-br from-blue-50/95 via-indigo-50/80 to-blue-50/95 border-blue-200 text-slate-800"
                     }`}>
-                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-3 pb-3 border-b border-emerald-200/60">
-                        <div className="flex items-center gap-2">
-                          <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4 pb-3.5 border-b border-emerald-200/70">
+                        <div className="flex items-start sm:items-center gap-3">
+                          <div className="p-2 rounded-lg bg-emerald-600 text-white shadow-2xs shrink-0">
+                            <ShieldCheck className="w-5 h-5" />
+                          </div>
                           <div>
-                            <h4 className="font-display font-bold text-sm text-slate-900 flex items-center gap-2">
-                              <span>Auditoría de Verificación coa Web Oficial</span>
-                              <span className="text-[10px] font-mono px-2 py-0.5 rounded-full font-bold bg-emerald-100 text-emerald-800 border border-emerald-200">
+                            <h4 className="font-display font-bold text-base text-slate-900 flex flex-wrap items-center gap-2">
+                              <span>{selectedAnalysis.factCheckAudit.verdictTitle || "Informe de Contraste e Verificación de Datos"}</span>
+                              <span className="text-[10px] font-mono px-2.5 py-0.5 rounded-full font-bold bg-emerald-100 text-emerald-800 border border-emerald-200">
                                 {selectedAnalysis.factCheckAudit.status === "corrected" ? "✓ Datos Rectificados con Fontes Oficiais" : "✓ 100% Contrastado"}
                               </span>
                             </h4>
                             <span className="text-[11px] text-slate-500 font-mono">
-                              {new Date(selectedAnalysis.factCheckAudit.auditedAt).toLocaleString("es-ES")}
+                              Auditado o {new Date(selectedAnalysis.factCheckAudit.auditedAt).toLocaleString("es-ES")} • Fontes consultadas automaticamente pola app
                             </span>
                           </div>
                         </div>
 
-                        <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-2 shrink-0">
                           <button
                             onClick={handleAutoFactCheck}
                             disabled={isAuditing}
-                            className="text-[11px] px-2.5 py-1 rounded-md font-semibold text-emerald-800 bg-white border border-emerald-300 hover:bg-emerald-50 transition-colors shadow-2xs flex items-center gap-1 cursor-pointer disabled:opacity-50"
-                            title="Volver a consultar e contrastar coa web en tempo real"
+                            className="text-xs px-3 py-1.5 rounded-lg font-semibold text-emerald-800 bg-white border border-emerald-300 hover:bg-emerald-50 transition-colors shadow-2xs flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                            title="Volver a consultar e contrastar coas fontes oficiais en tempo real"
                           >
-                            <RotateCcw className={`w-3 h-3 text-emerald-600 ${isAuditing ? "animate-spin" : ""}`} />
-                            <span>{isAuditing ? "Consultando..." : "Re-auditar"}</span>
+                            <RotateCcw className={`w-3.5 h-3.5 text-emerald-600 ${isAuditing ? "animate-spin" : ""}`} />
+                            <span>{isAuditing ? "Contrastando..." : "Actualizar Contraste"}</span>
                           </button>
                         </div>
                       </div>
 
-                      <p className="text-xs leading-relaxed text-slate-700 font-medium mb-3">
-                        {selectedAnalysis.factCheckAudit.summaryAudit}
-                      </p>
+                      {/* Analytical Summary of Contrast */}
+                      <div className="mb-4 bg-white/70 p-3.5 rounded-lg border border-emerald-200/60">
+                        <span className="text-[11px] font-mono font-bold text-emerald-900 uppercase tracking-wider block mb-1">
+                          Dictame de Verificación e Contraste:
+                        </span>
+                        <p className="text-xs sm:text-[13px] leading-relaxed text-slate-700 font-medium whitespace-pre-line">
+                          {selectedAnalysis.factCheckAudit.summaryAudit}
+                        </p>
+                      </div>
 
+                      {/* Interactive Contrast Matrix / Cadro Comparativo */}
+                      {selectedAnalysis.factCheckAudit.contrastTable && selectedAnalysis.factCheckAudit.contrastTable.length > 0 && (
+                        <div className="mb-4 bg-white rounded-xl border border-emerald-200 overflow-hidden shadow-2xs">
+                          <div className="bg-emerald-100/70 px-4 py-2.5 border-b border-emerald-200 flex items-center justify-between">
+                            <span className="text-xs font-bold font-display text-emerald-950 flex items-center gap-1.5">
+                              <Scale className="w-4 h-4 text-emerald-700" />
+                              Cadro Comparativo de Contraste: Dato Analizado vs. Fonte Oficial Fiable
+                            </span>
+                            <span className="text-[10.5px] font-mono font-semibold text-emerald-800 bg-emerald-200/60 px-2 py-0.5 rounded">
+                              {selectedAnalysis.factCheckAudit.contrastTable.length} datos contrastados
+                            </span>
+                          </div>
+                          <div className="divide-y divide-emerald-100/80 text-xs">
+                            {selectedAnalysis.factCheckAudit.contrastTable.map((item, cidx) => (
+                              <div key={cidx} className="p-3.5 hover:bg-emerald-50/40 transition-colors space-y-2.5">
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                  <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider font-mono">
+                                    Comprobación #{cidx + 1}
+                                  </span>
+                                  <span className={`text-[10.5px] font-bold px-2 py-0.5 rounded-full font-mono flex items-center gap-1 ${
+                                    item.status === "corrected"
+                                      ? "bg-amber-100 text-amber-900 border border-amber-300"
+                                      : "bg-emerald-100 text-emerald-900 border border-emerald-300"
+                                  }`}>
+                                    {item.status === "corrected" ? "⚠️ Rectificado con fontes oficiais" : "✓ Dato Exacto e Verificado"}
+                                  </span>
+                                </div>
+
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                  <div className="p-2.5 bg-rose-50/70 border border-rose-150 rounded-lg">
+                                    <span className="text-[10px] font-bold text-rose-800 uppercase block mb-1">
+                                      Dato / Afirmación no texto inicial:
+                                    </span>
+                                    <p className="text-slate-700 leading-snug font-sans">{item.claimOrFact}</p>
+                                  </div>
+                                  <div className="p-2.5 bg-emerald-50/80 border border-emerald-200 rounded-lg">
+                                    <span className="text-[10px] font-bold text-emerald-800 uppercase block mb-1">
+                                      Dato contrastado na fonte fiable:
+                                    </span>
+                                    <p className="text-slate-800 font-semibold leading-snug font-sans">{item.officialVerification}</p>
+                                  </div>
+                                </div>
+
+                                <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-[11px] text-slate-500">
+                                  <div className="flex items-center gap-1.5 font-medium text-emerald-900">
+                                    <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
+                                    <span>Organismo / Fonte oficial fiable: <strong>{item.reliableSource}</strong></span>
+                                  </div>
+                                  {item.sourceUrl && (
+                                    <a
+                                      href={item.sourceUrl}
+                                      target="_blank"
+                                      rel="noreferrer"
+                                      className="text-emerald-700 hover:text-emerald-900 underline flex items-center gap-1"
+                                    >
+                                      <span>Consultar fonte orixinal</span>
+                                      <ExternalLink className="w-2.5 h-2.5" />
+                                    </a>
+                                  )}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Inaccuracies Detected and Corrected */}
                       {selectedAnalysis.factCheckAudit.detectedErrors && selectedAnalysis.factCheckAudit.detectedErrors.length > 0 && (
-                        <div className="mb-3 p-3 bg-white/80 rounded-lg border border-emerald-200/80 text-xs space-y-1.5">
+                        <div className="mb-3.5 p-3.5 bg-white/90 rounded-lg border border-emerald-200/80 text-xs space-y-1.5">
                           <span className="font-semibold text-rose-800 text-[11px] uppercase tracking-wider block">
-                            Inexactitudes detectadas e emendadas:
+                            Inexactitudes detectadas e rectificadas no informe:
                           </span>
                           <ul className="list-disc list-inside space-y-1 text-slate-700 text-[11.5px]">
                             {selectedAnalysis.factCheckAudit.detectedErrors.map((err, eidx) => (
@@ -1670,40 +1756,62 @@ export default function App() {
                         </div>
                       )}
 
+                      {/* Reliable Sources Found Automatically By The App */}
                       {selectedAnalysis.factCheckAudit.verifiedSources && selectedAnalysis.factCheckAudit.verifiedSources.length > 0 && (
-                        <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-emerald-200/50">
-                          <span className="text-[11px] font-mono text-slate-500 font-semibold">Fontes oficiais consultadas:</span>
-                          {selectedAnalysis.factCheckAudit.verifiedSources.map((src, sidx) => (
-                            <a
-                              key={sidx}
-                              href={src.url}
-                              target="_blank"
-                              referrerPolicy="no-referrer"
-                              rel="noreferrer"
-                              className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-800 bg-white/90 hover:bg-white border border-emerald-200 px-2 py-0.5 rounded shadow-2xs transition-colors"
-                            >
-                              <span>{src.title}</span>
-                              <ExternalLink className="w-2.5 h-2.5 text-emerald-600" />
-                            </a>
-                          ))}
+                        <div className="pt-2 border-t border-emerald-200/60">
+                          <div className="flex items-center gap-1.5 mb-2 text-xs font-semibold text-slate-700">
+                            <ExternalLink className="w-3.5 h-3.5 text-emerald-600" />
+                            <span>Fontes oficiais e fiables consultadas automaticamente pola app (sen que teñas que buscalas ti):</span>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-2">
+                            {selectedAnalysis.factCheckAudit.verifiedSources.map((src, sidx) => (
+                              <a
+                                key={sidx}
+                                href={src.url}
+                                target="_blank"
+                                referrerPolicy="no-referrer"
+                                rel="noreferrer"
+                                className="inline-flex items-center gap-1.5 text-[11px] font-medium text-emerald-900 bg-white hover:bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded-md shadow-2xs transition-colors"
+                              >
+                                <span>{src.title}</span>
+                                <ExternalLink className="w-3 h-3 text-emerald-600 shrink-0" />
+                              </a>
+                            ))}
+                          </div>
                         </div>
                       )}
                     </div>
                   ) : (
-                    <div className="bg-slate-50 border border-slate-200/80 rounded-xl p-4 shadow-2xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs">
-                      <div className="flex items-center gap-2.5 text-slate-600">
-                        <Search className="w-4 h-4 text-emerald-600 shrink-0" />
-                        <span>
-                          ¿Observas algunha cifra, data, resultado electoral ou candidato inexacto? Podes premer en <strong>Auditar coa Web</strong> para que a app consulte fontes oficiais en tempo real ou en <strong>Propor Corrección</strong>.
-                        </span>
+                    <div className="bg-gradient-to-r from-slate-50 via-emerald-50/30 to-slate-50 border border-emerald-200/80 rounded-xl p-4 sm:p-5 shadow-2xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 text-xs">
+                      <div className="flex items-start gap-3 text-slate-700">
+                        <div className="p-2 rounded-lg bg-emerald-100 text-emerald-700 shrink-0 mt-0.5">
+                          <Search className="w-4 h-4" />
+                        </div>
+                        <div className="space-y-0.5">
+                          <h4 className="font-display font-semibold text-slate-900 text-sm">
+                            ¿Queres contrastar todos os datos coas fontes máis fiables?
+                          </h4>
+                          <p className="text-slate-600 leading-relaxed text-xs">
+                            A propia app consulta en tempo real o arquivo oficial, hemerotecas e rexistros de máxima solvencia e xera un <strong>informe detallado de contraste</strong> comparando cada dato sen que teñas que buscalos ti.
+                          </p>
+                        </div>
                       </div>
                       <button
                         onClick={handleAutoFactCheck}
                         disabled={isAuditing}
-                        className="shrink-0 px-3 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-md font-semibold text-xs transition-colors shadow-2xs cursor-pointer flex items-center gap-1 disabled:opacity-50"
+                        className="shrink-0 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg font-semibold text-xs transition-colors shadow-2xs cursor-pointer flex items-center gap-2 disabled:opacity-50"
                       >
-                        <Search className="w-3 h-3 text-emerald-200" />
-                        <span>{isAuditing ? "Auditando..." : "Auditar agora"}</span>
+                        {isAuditing ? (
+                          <>
+                            <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
+                            <span>Contrastando con fontes oficiais...</span>
+                          </>
+                        ) : (
+                          <>
+                            <Search className="w-3.5 h-3.5 text-emerald-200" />
+                            <span>Auditar e Contrastar agora</span>
+                          </>
+                        )}
                       </button>
                     </div>
                   )}
@@ -1854,19 +1962,24 @@ export default function App() {
                         Desglose intuitivo de los conceptos complejos del artículo mediante ejemplos cuantitativos tangibles, datos financieros y ratios de coste:
                       </p>
 
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         {selectedAnalysis.numericalExamples.map((item, idx) => (
-                          <div key={idx} className="p-4 bg-emerald-900/60 border border-emerald-800 rounded-lg space-y-2 flex flex-col justify-between">
-                            <div>
-                              <div className="flex items-center justify-between gap-2 mb-1.5">
-                                <span className="text-xs font-semibold text-emerald-200">
+                          <div 
+                            key={idx} 
+                            className="p-4 sm:p-5 bg-emerald-900/70 border border-emerald-800/90 rounded-xl space-y-3 flex flex-col justify-between overflow-hidden shadow-xs hover:border-emerald-700/80 transition-all"
+                          >
+                            <div className="space-y-2.5 min-w-0">
+                              <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-2.5">
+                                <span className="text-xs font-semibold text-emerald-200 leading-snug break-words font-display min-w-0">
                                   {item.concept}
                                 </span>
-                                <span className="text-xs font-mono font-bold text-amber-300 bg-amber-950/80 border border-amber-800/60 px-2 py-0.5 rounded shrink-0">
-                                  {item.figureOrCost}
-                                </span>
+                                <div className="self-start sm:self-auto shrink-0 max-w-full">
+                                  <span className="inline-block text-xs font-mono font-bold text-amber-300 bg-amber-950/90 border border-amber-700/70 px-2.5 py-1 rounded-md shadow-2xs break-words whitespace-normal text-left sm:text-right max-w-full leading-relaxed">
+                                    {item.figureOrCost}
+                                  </span>
+                                </div>
                               </div>
-                              <p className="text-xs text-emerald-100/90 leading-relaxed font-sans">
+                              <p className="text-xs text-emerald-100/90 leading-relaxed font-sans break-words whitespace-pre-line">
                                 {item.explanation}
                               </p>
                             </div>
