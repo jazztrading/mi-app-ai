@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { motion, AnimatePresence } from "motion/react";
-import { apiFetch } from "./api";
+import { apiFetch, apiFetchRestoring } from "./api";
 import { 
   FileText, 
   Link, 
@@ -243,7 +243,7 @@ export default function App() {
     setError(null);
 
     try {
-      const res = await apiFetch(`/api/analyses/${selectedAnalysis.id}/auto-factcheck`, {
+      const res = await apiFetchRestoring(selectedAnalysis, `/api/analyses/${selectedAnalysis.id}/auto-factcheck`, {
         method: "POST",
         headers: { "Content-Type": "application/json" }
       });
@@ -278,7 +278,7 @@ export default function App() {
     setError(null);
 
     try {
-      const res = await apiFetch(`/api/analyses/${selectedAnalysis.id}/correct`, {
+      const res = await apiFetchRestoring(selectedAnalysis, `/api/analyses/${selectedAnalysis.id}/correct`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -320,7 +320,7 @@ export default function App() {
     setError(null);
 
     try {
-      const res = await apiFetch(`/api/analyses/${selectedAnalysis.id}`, {
+      const res = await apiFetchRestoring(selectedAnalysis, `/api/analyses/${selectedAnalysis.id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -358,7 +358,7 @@ export default function App() {
     setError(null);
 
     try {
-      const res = await apiFetch(`/api/analyses/${selectedAnalysis.id}/switch-language`, {
+      const res = await apiFetchRestoring(selectedAnalysis, `/api/analyses/${selectedAnalysis.id}/switch-language`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ targetLanguage: targetLang })
