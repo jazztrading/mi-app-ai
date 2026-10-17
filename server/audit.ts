@@ -27,11 +27,12 @@ export interface ClaimCheck {
   correction?: string;
   evidenceQuote?: string; // frase corta literal de la evidencia que sostiene el veredicto
   evidence: Array<{ title: string; url: string }>; // solo fuentes reales devueltas por el buscador
+  searchFailed?: boolean; // la búsqueda falló técnicamente: NO equivale a "no hay evidencia"
 }
 
 export interface AuditDeps {
   llmJson: (prompt: string, system: string, schema: any) => Promise<string>;
-  groundedSearch: (prompt: string) => Promise<{ text: string; sources: Array<{ title: string; url: string }>; failed?: boolean }>;
+  groundedSearch: (prompt: string) => Promise<{ text: string; sources: Array<{ title: string; url: string }>; failed?: boolean; error?: string }>;
 }
 
 export interface AuditInput {
@@ -45,7 +46,7 @@ export interface AuditInput {
 export interface AuditOutcome {
   claimChecks: ClaimCheck[];
   counts: Record<ClaimVerdict, number>;
-  coverage: { extracted: number; considered: number; searched: number; notCheckable: number; textTruncated: boolean; maxClaims: number };
+  coverage: { extracted: number; considered: number; searched: number; notCheckable: number; textTruncated: boolean; maxClaims: number; searchFailed: number };
   auditedFrom: "original_text" | "summary_only";
   status: "verified" | "corrected" | "inconclusive";
   summaryAudit: string;
@@ -55,7 +56,8 @@ export interface AuditOutcome {
 }
 
 export const AUDIT_MAX_CLAIMS = Math.max(1, Number(process.env.AUDIT_MAX_CLAIMS) || 10);
-export const AUDIT_CONCURRENCY = 3;
+export const AUDIT_CONCURRENCY = 2;
+const DEFAULT_RETRY_DELAY_MS = 4000;
 export const AUDIT_TEXT_CAP = 60_000;
 const MIN_SOURCE_TEXT = 200;
 const VERDICTS: ClaimVerdict[] = ["supported", "contradicted", "partially_supported", "insufficient_evidence", "not_checkable"];
@@ -155,7 +157,27 @@ Reglas:
 }
 
 // ── 2. evidencia (a ciegas respecto a la afirmación del autor) ───────────────
-async function searchEvidence(deps: AuditDeps, question: string) {
+/** Mensaje de error corto y sin secretos, apto para mostrar al usuario. */
+export function sanitizeError(raw: any): string {
+  let msg = typeof raw === "string" ? raw : raw?.message || "";
+  try {
+    const j = JSON.parse(msg);
+    if (j?.error?.message) msg = String(j.error.message);
+  } catch {
+    /* no era JSON */
+  }
+  msg = msg.replace(/AIza[0-9A-Za-z_\-]{20,}/g, "[clave]").replace(/\s+/g, " ").trim();
+  return msg.slice(0, 200) || "error desconocido";
+}
+
+interface Evidence {
+  text: string;
+  sources: Array<{ title: string; url: string }>;
+  failed: boolean;
+  error?: string;
+}
+
+async function searchEvidence(deps: AuditDeps, question: string): Promise<Evidence> {
   const prompt = `Pregunta de verificación: ${question}
 
 Instrucciones:
@@ -165,9 +187,12 @@ Instrucciones:
 - No asumas que ninguna afirmación previa sea cierta. No escribas URLs: las fuentes se registran aparte.`;
   try {
     const r = await deps.groundedSearch(prompt);
-    return { text: (r.text || "").slice(0, 2500), sources: r.failed ? [] : r.sources || [] };
-  } catch {
-    return { text: "", sources: [] };
+    if (r.failed) return { text: "", sources: [], failed: true, error: sanitizeError(r.error || "el buscador no respondió") };
+    const text = (r.text || "").slice(0, 2500);
+    if (!text.trim()) return { text: "", sources: [], failed: true, error: "respuesta vacía del buscador" };
+    return { text, sources: r.sources || [], failed: false };
+  } catch (e: any) {
+    return { text: "", sources: [], failed: true, error: sanitizeError(e) };
   }
 }
 
@@ -253,6 +278,9 @@ const T: Record<string, Record<string, string>> = {
     truncated: "AVISO: el texto era muy largo y solo se auditó su primera parte.",
     limits: "Límites: se revisan como máximo {max} afirmaciones por informe y la evidencia procede de una búsqueda automática. Que no se señale un error no garantiza que no exista; conviene revisar las fuentes enlazadas.",
     noClaims: "No se encontraron afirmaciones comprobables en el texto.",
+    failExplain: "Falló la búsqueda de evidencia ({err}). Esto no significa que no exista evidencia: vuelve a intentarlo más tarde.",
+    failNote: "AVISO: la búsqueda de evidencia falló por un error técnico en {f} de {n} afirmaciones comprobables; ese resultado NO indica ausencia de evidencia. Vuelve a intentarlo más tarde.",
+    failedCount: "{f} sin comprobar por fallo de búsqueda.",
   },
   galego: {
     title: "Informe de contraste afirmación por afirmación",
@@ -265,6 +293,9 @@ const T: Record<string, Record<string, string>> = {
     truncated: "AVISO: o texto era moi longo e só se auditou a súa primeira parte.",
     limits: "Límites: revísanse como máximo {max} afirmacións por informe e a evidencia procede dunha busca automática. Que non se sinale un erro non garante que non exista; convén revisar as fontes ligadas.",
     noClaims: "Non se atoparon afirmacións comprobables no texto.",
+    failExplain: "Fallou a busca de evidencia ({err}). Isto non significa que non exista evidencia: volve tentalo máis tarde.",
+    failNote: "AVISO: a busca de evidencia fallou por un erro técnico en {f} de {n} afirmacións comprobables; ese resultado NON indica ausencia de evidencia. Volve tentalo máis tarde.",
+    failedCount: "{f} sen comprobar por fallo de busca.",
   },
   català: {
     title: "Informe de contrast afirmació per afirmació",
@@ -277,6 +308,9 @@ const T: Record<string, Record<string, string>> = {
     truncated: "AVÍS: el text era molt llarg i només se n'ha auditat la primera part.",
     limits: "Límits: es revisen com a màxim {max} afirmacions per informe i l'evidència prové d'una cerca automàtica. Que no s'assenyali un error no garanteix que no existeixi; convé revisar les fonts enllaçades.",
     noClaims: "No s'han trobat afirmacions comprovables al text.",
+    failExplain: "Ha fallat la cerca d'evidència ({err}). Això no vol dir que no n'hi hagi: torna-ho a provar més tard.",
+    failNote: "AVÍS: la cerca d'evidència ha fallat per un error tècnic en {f} de {n} afirmacions comprovables; aquest resultat NO indica absència d'evidència. Torna-ho a provar més tard.",
+    failedCount: "{f} sense comprovar per error de cerca.",
   },
 };
 
@@ -293,17 +327,25 @@ export function buildSummary(args: {
   const { counts: n, coverage: cv } = args;
   if (cv.extracted === 0) return `${t.noClaims}\n\n${t.limits.replace("{max}", String(cv.maxClaims))}`;
 
+  const failed = cv.searchFailed;
+  const insufficient = Math.max(0, n.insufficient_evidence - failed); // sin evidencia de verdad, sin contar fallos técnicos
+  const evaluated = cv.searched - failed; // afirmaciones con evidencia efectivamente evaluada
+
   const parts: string[] = [];
   if (args.auditedFrom === "summary_only") parts.push(t.summaryOnly);
   if (cv.textTruncated) parts.push(t.truncated);
   parts.push(fill(t.head, { extracted: cv.extracted, considered: cv.considered, searched: cv.searched, nc: cv.notCheckable }));
-  parts.push(fill(t.result, { s: n.supported, p: n.partially_supported, c: n.contradicted, i: n.insufficient_evidence }));
+  let result = fill(t.result, { s: n.supported, p: n.partially_supported, c: n.contradicted, i: insufficient });
+  if (failed > 0) result += " " + fill(t.failedCount, { f: failed });
+  parts.push(result);
+  if (failed > 0) parts.push(fill(t.failNote, { f: failed, n: cv.searched }));
 
   const contra = args.checks.filter((c) => c.verdict === "contradicted");
   const partial = args.checks.filter((c) => c.verdict === "partially_supported");
   if (contra.length) {
     parts.push(`${t.contradicted}\n` + contra.map((c, i) => `${i + 1}. «${c.claim}» → ${c.correction || c.explanation}`).join("\n"));
-  } else {
+  } else if (evaluated > 0) {
+    // Solo se afirma "ninguna contradicha" si al menos una afirmación llegó a evaluarse con evidencia.
     parts.push(t.none);
   }
   if (partial.length) {
@@ -314,7 +356,7 @@ export function buildSummary(args: {
 }
 
 // ── orquestación ─────────────────────────────────────────────────────────────
-export async function runClaimAudit(deps: AuditDeps, input: AuditInput): Promise<AuditOutcome> {
+export async function runClaimAudit(deps: AuditDeps, input: AuditInput, opts: { retryDelayMs?: number; concurrency?: number } = {}): Promise<AuditOutcome> {
   const hasOriginal = !!input.sourceText && input.sourceText.trim().length >= MIN_SOURCE_TEXT;
   const auditedFrom: AuditOutcome["auditedFrom"] = hasOriginal ? "original_text" : "summary_only";
   const fullText = hasOriginal
@@ -335,19 +377,25 @@ export async function runClaimAudit(deps: AuditDeps, input: AuditInput): Promise
   const checkable = considered.filter((c) => c.claimType !== "opinion" && c.claimType !== "prediction");
 
   // 2) evidencia, con concurrencia acotada
-  const evidenceById = new Map<string, { text: string; sources: Array<{ title: string; url: string }> }>();
-  await mapPool(checkable, AUDIT_CONCURRENCY, async (c) => {
-    const q = c.neutralQuestion || c.claim;
-    evidenceById.set(c.id, await searchEvidence(deps, q));
+  const evidenceById = new Map<string, Evidence>();
+  await mapPool(checkable, opts.concurrency ?? AUDIT_CONCURRENCY, async (c) => {
+    evidenceById.set(c.id, await searchEvidence(deps, c.neutralQuestion || c.claim));
   });
+  // Segunda pasada, en serie y tras una pausa, solo para las búsquedas que fallaron por motivos técnicos (p. ej. límite de ritmo).
+  const failedFirst = checkable.filter((c) => evidenceById.get(c.id)?.failed);
+  if (failedFirst.length) {
+    await new Promise((r) => setTimeout(r, opts.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS));
+    for (const c of failedFirst) evidenceById.set(c.id, await searchEvidence(deps, c.neutralQuestion || c.claim));
+  }
 
-  // 3) juicio (una sola llamada para todas)
+  // 3) juicio (una sola llamada) solo para las afirmaciones cuya búsqueda funcionó
+  const judgeable = checkable.filter((c) => !evidenceById.get(c.id)?.failed);
   const judged = new Map<string, any>();
-  if (checkable.length) {
+  if (judgeable.length) {
     try {
       const results = await judgeClaims(
         deps,
-        checkable.map((c) => ({
+        judgeable.map((c) => ({
           id: c.id,
           claim: c.claim,
           evidence: evidenceById.get(c.id)?.text || "",
@@ -357,7 +405,7 @@ export async function runClaimAudit(deps: AuditDeps, input: AuditInput): Promise
       );
       for (const r of results) if (r && typeof r.id === "string") judged.set(r.id, r);
     } catch {
-      /* si el juicio falla, todas quedan como evidencia insuficiente (ver abajo) */
+      /* si el juicio falla, esas afirmaciones quedan como evidencia insuficiente (ver abajo) */
     }
   }
 
@@ -380,7 +428,18 @@ export async function runClaimAudit(deps: AuditDeps, input: AuditInput): Promise
         evidence: [],
       };
     }
-    const ev = evidenceById.get(c.id) || { text: "", sources: [] };
+    const ev: Evidence = evidenceById.get(c.id) || { text: "", sources: [], failed: false };
+    if (ev.failed) {
+      const tt = T[input.lang] || T.castellano;
+      return {
+        ...base,
+        verdict: "insufficient_evidence" as ClaimVerdict,
+        confidence: 0,
+        explanation: fill(tt.failExplain, { err: ev.error || "error desconocido" }),
+        evidence: [],
+        searchFailed: true,
+      };
+    }
     const j = judged.get(c.id);
     const rawVerdict: ClaimVerdict = j && VERDICTS.includes(j.verdict) && j.verdict !== "not_checkable" ? j.verdict : "insufficient_evidence";
     const g = applyGuards({ verdict: rawVerdict, confidence: j ? j.confidence : 0, nSources: ev.sources.length });
@@ -405,6 +464,7 @@ export async function runClaimAudit(deps: AuditDeps, input: AuditInput): Promise
     notCheckable: considered.length - checkable.length,
     textTruncated,
     maxClaims: AUDIT_MAX_CLAIMS,
+    searchFailed: claimChecks.filter((c) => c.searchFailed).length,
   };
 
   const hasProblem = claimChecks.some((c) => (c.verdict === "contradicted" || c.verdict === "partially_supported") && c.confidence >= 0.5);
