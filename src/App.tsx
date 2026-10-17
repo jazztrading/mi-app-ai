@@ -138,6 +138,7 @@ interface ClaimCheck {
   correction?: string;
   evidenceQuote?: string;
   evidence: Array<{ title: string; url: string }>;
+  searchFailed?: boolean;
 }
 
 const CLAIM_VERDICT_UI: Record<ClaimVerdict, { label: string; chip: string }> = {
@@ -155,6 +156,7 @@ interface FactCheckAudit {
   auditedFrom?: "original_text" | "summary_only";
   claimChecks?: ClaimCheck[];
   counts?: Record<ClaimVerdict, number>;
+  coverage?: { searchFailed?: number };
   previousExecutiveSummary?: string;
   previousKeyPoints?: string[];
   verdictTitle?: string;
@@ -1675,7 +1677,7 @@ export default function App() {
                               <span>{selectedAnalysis.factCheckAudit.verdictTitle || "Informe de Contraste e Verificación de Datos"}</span>
                               <span className="text-[10px] font-mono px-2.5 py-0.5 rounded-full font-bold bg-emerald-100 text-emerald-800 border border-emerald-200">
                                 {selectedAnalysis.factCheckAudit.method === "claim_level_v2" && selectedAnalysis.factCheckAudit.counts
-                                  ? `${selectedAnalysis.factCheckAudit.counts.supported} respaldadas · ${selectedAnalysis.factCheckAudit.counts.contradicted + selectedAnalysis.factCheckAudit.counts.partially_supported} con errores · ${selectedAnalysis.factCheckAudit.counts.insufficient_evidence} sin evidencia suficiente`
+                                  ? `${selectedAnalysis.factCheckAudit.counts.supported} respaldadas · ${selectedAnalysis.factCheckAudit.counts.contradicted + selectedAnalysis.factCheckAudit.counts.partially_supported} con errores · ${Math.max(0, selectedAnalysis.factCheckAudit.counts.insufficient_evidence - (selectedAnalysis.factCheckAudit.coverage?.searchFailed || 0))} sin evidencia suficiente${(selectedAnalysis.factCheckAudit.coverage?.searchFailed || 0) > 0 ? ` · ${selectedAnalysis.factCheckAudit.coverage?.searchFailed} búsquedas fallidas` : ""}`
                                   : "Auditoría anterior (sin detalle por afirmación)"}
                               </span>
                             </h4>
@@ -1724,10 +1726,10 @@ export default function App() {
                             {selectedAnalysis.factCheckAudit.claimChecks.map((c) => (
                               <div key={c.id} className="p-3.5 space-y-2">
                                 <div className="flex flex-wrap items-center justify-between gap-2">
-                                  <span className={`text-[10.5px] font-bold px-2 py-0.5 rounded-full font-mono border ${CLAIM_VERDICT_UI[c.verdict].chip}`}>
-                                    {CLAIM_VERDICT_UI[c.verdict].label}
+                                  <span className={`text-[10.5px] font-bold px-2 py-0.5 rounded-full font-mono border ${c.searchFailed ? "bg-orange-100 text-orange-900 border-orange-300" : CLAIM_VERDICT_UI[c.verdict].chip}`}>
+                                    {c.searchFailed ? "Búsqueda fallida (error técnico)" : CLAIM_VERDICT_UI[c.verdict].label}
                                   </span>
-                                  {c.verdict !== "not_checkable" && (
+                                  {c.verdict !== "not_checkable" && !c.searchFailed && (
                                     <span className="text-[10.5px] font-mono text-slate-500">confianza {c.confidence.toFixed(2)}</span>
                                   )}
                                 </div>
