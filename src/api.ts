@@ -42,3 +42,21 @@ export async function apiFetch(input: string, init: RequestInit = {}): Promise<R
   }
   return res;
 }
+
+/**
+ * Para acciones sobre un análisis ya guardado (auditar, corregir, editar, cambiar idioma).
+ * Si el servidor lo ha perdido (404, p. ej. tras reiniciarse Render), reenvía la copia que conserva
+ * el navegador a /restore y repite la acción una vez.
+ */
+export async function apiFetchRestoring(analysis: { id: string }, input: string, init: RequestInit = {}): Promise<Response> {
+  let res = await apiFetch(input, init);
+  if (res.status === 404) {
+    const restored = await apiFetch(`/api/analyses/${analysis.id}/restore`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(analysis),
+    });
+    if (restored.ok) res = await apiFetch(input, init);
+  }
+  return res;
+}
