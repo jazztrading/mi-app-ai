@@ -1731,6 +1731,23 @@ Genera la versión corregida y el resumen de cambios aplicados.
   });
 
   // Direct manual save endpoint for editable sections
+  // Rehidrata un análisis que el navegador conserva pero el servidor ha perdido (disco efímero de Render).
+  // Nunca sobrescribe uno existente. Solo restaura objetos con la forma de AnalysisResult.
+  app.post("/api/analyses/:id/restore", (req, res) => {
+    const { id } = req.params;
+    if (db[id]) return res.json(db[id]);
+    const a = req.body;
+    const valid =
+      a && typeof a === "object" && a.id === id &&
+      typeof a.url === "string" && typeof a.title === "string" && typeof a.executiveSummary === "string" &&
+      typeof a.analyzedAt === "string" && Array.isArray(a.keyPoints) && Array.isArray(a.categories) &&
+      Array.isArray(a.bibliographicSources);
+    if (!valid) return res.status(400).json({ error: "Análisis no válido para restaurar." });
+    db[id] = a as AnalysisResult;
+    saveDatabase(db);
+    res.json(db[id]);
+  });
+
   app.put("/api/analyses/:id", (req, res) => {
     const { id } = req.params;
     const analysis = db[id];
