@@ -9,9 +9,10 @@ import mammoth from "mammoth";
 import { PDFParse } from "pdf-parse";
 import {
   HttpError, MAX_BODY_MB, requireAuth, failedAuthLimiter, apiLimiter, costlyLimiter,
-  securityHeaders, ID_RE, validateAnalyzeBody,
+  securityHeaders, ID_RE, validateAnalyzeBody, dailyCostlyCap, dailyCostlyMax, isAuthRequired,
 } from "./server/security";
 import { safeFetch, parseAndValidateUrl, UnsafeUrlError } from "./server/safeFetch";
+import { runClaimAudit, rewriteWithCorrections, type AuditDeps, type ClaimCheck, type ClaimVerdict } from "./server/audit";
 
 // Load environment variables
 dotenv.config();
@@ -103,7 +104,7 @@ export interface DataContrastItem {
 
 export interface FactCheckAudit {
   auditedAt: string;
-  status: "verified" | "corrected";
+  status: "verified" | "corrected" | "inconclusive";
   verdictTitle?: string;
   summaryAudit: string;
   detectedErrors: string[];
@@ -111,6 +112,14 @@ export interface FactCheckAudit {
   contrastTable?: DataContrastItem[];
   verifiedSources: Array<{ title: string; url: string; snippet?: string; reliability?: string }>;
   userFeedback?: string;
+  // Auditoría v2 (todos opcionales: los registros anteriores no necesitan migración)
+  method?: "claim_level_v2";
+  auditedFrom?: "original_text" | "summary_only";
+  claimChecks?: ClaimCheck[];
+  counts?: Record<ClaimVerdict, number>;
+  coverage?: { extracted: number; considered: number; searched: number; notCheckable: number; textTruncated: boolean; maxClaims: number };
+  previousExecutiveSummary?: string;
+  previousKeyPoints?: string[];
 }
 
 export interface AnalysisResult {
@@ -583,8 +592,9 @@ async function generateTextWithFallback(
 // Grounded live web search tool for fact-checking and automated consultation
 async function generateGroundedSearchText(
   prompt: string,
-  systemInstruction?: string
-): Promise<{ text: string; sources: Array<{ title: string; url: string; snippet?: string }> }> {
+  systemInstruction?: string,
+  opts?: { strict?: boolean } // strict: sin URLs sacadas del texto del modelo ni respaldo sin búsqueda
+): Promise<{ text: string; sources: Array<{ title: string; url: string; snippet?: string }>; failed?: boolean }> {
   const models = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"];
   let lastErr: any = null;
 
@@ -620,7 +630,7 @@ async function generateGroundedSearchText(
             }
           }
 
-          if (sources.length === 0) {
+          if (sources.length === 0 && !opts?.strict) {
             const urlMatches = text.match(/https?:\/\/[^\s)"]+/g);
             if (urlMatches) {
               urlMatches.slice(0, 5).forEach((u) => {
@@ -645,6 +655,9 @@ async function generateGroundedSearchText(
     }
   }
 
+  // En modo estricto no se sustituye la búsqueda por texto generado de memoria: se avisa del fallo.
+  if (opts?.strict) return { text: "", sources: [], failed: true };
+
   // Fallback to text generation if grounded tool failed
   try {
     const plainText = await generateTextWithFallback(prompt, systemInstruction || "");
@@ -657,6 +670,9 @@ async function generateGroundedSearchText(
 async function startServer() {
   const app = express();
   app.disable("x-powered-by");
+  if (!isAuthRequired()) {
+    console.warn(`AVISO: REQUIRE_AUTH=false → la API está ABIERTA. Protecciones activas: límite por IP, tope global de ${dailyCostlyMax()} operaciones/día, anti-SSRF. Fija un tope mensual de gasto en Google AI Studio.`);
+  }
   app.set("trust proxy", Number(process.env.TRUST_PROXY ?? 1)); // Render está detrás de un proxy
 
   // Cuerpo JSON acotado (los ficheros viajan en base64)
@@ -718,6 +734,12 @@ async function startServer() {
       next(e);
     }
   });
+
+  // Tope global diario: se registra DESPUÉS de las validaciones para que las peticiones inválidas no lo consuman
+  app.post(
+    ["/api/analyze", "/api/full-translation", "/api/analyses/:id/auto-factcheck", "/api/analyses/:id/correct", "/api/analyses/:id/switch-language"],
+    dailyCostlyCap
+  );
 
   // Main Analysis Endpoint
   app.post("/api/analyze", async (req, res) => {
@@ -1454,142 +1476,57 @@ ${targetText.substring(0, 45000)}`;
       }
 
       const outputLang = analysis.outputLanguage || detectLanguage(`${analysis.title} ${analysis.executiveSummary}`);
-      const isGal = outputLang === "galego";
-      const isCat = outputLang === "català";
+      console.log(`[Audit v2] Auditoría por afirmaciones de "${analysis.title}" (idioma: ${outputLang})...`);
 
-      console.log(`[Auto Fact-Check] Initiating live web audit for analysis "${analysis.title}" (language: ${outputLang})...`);
-
-      // 1. Search grounding query to verify facts, elections, numbers, candidates
-      const searchPrompt = `Realiza una investigación exhaustiva y verificación con fuentes oficiales (bases de datos del Ministerio del Interior, hemerotecas históricas, archivos electorales, publicaciones de rigor) sobre los datos fácticos de este recurso:
-Tema/Consulta: "${analysis.title}"
-Categorías: ${analysis.categories.join(", ")}
-Resumen actual:
-"${analysis.executiveSummary}"
-Puntos clave actuales:
-${analysis.keyPoints.join("\n")}
-
-Comprueba con máximo rigor:
-1. Fechas exactas, años de elecciones generales/autonómicas o acontecimientos.
-2. Cifras de escaños, número de votos, porcentajes oficiales y comparativa histórica completa.
-   (POR EJEMPLO: Si se analiza el mejor resultado histórico del Bloque Nacionalista Galego (BNG) en las elecciones legislativas al Congreso de los Diputados, comprueba la serie histórica completa: 1996 [2 escaños, 270.408 votos], 2000 [3 ESCAÑOS, 306.268 votos, 1,32% - diputados Francisco Rodríguez, Guillerme Vázquez y Carlos Aymerich], 2004 [2 escaños], 2008 [2 escaños], 2011 [2 escaños], 2019 [1 escaño], 2023 [1 escaño]. El año 2000 es el récord histórico del BNG, no 1996).
-3. Candidatos que se presentaron o resultaron electos (cabezas de lista oficiales por provincias).
-4. Identifica cualquier dato inexacto, cifra errónea, año falso o candidato omitido, y proporciona los datos oficiales verdaderos y fuentes contrastadas.`;
-
-      const { text: groundedEvidence, sources } = await generateGroundedSearchText(searchPrompt);
-
-      // 2. Structured prompt to generate the rectified analysis & audit record
-      const auditSystemInstruction = `Eres un auditor epistemológico y verificador de hechos (fact-checker) de máxima rigurosidad.
-Tu misión es contrastar el análisis preexistente contra la evidencia contrastada obtenida por búsqueda web, identificar con precisión quirúrgica cualquier error, cifra desactualizada o falsedad histórica, y generar una versión rectificada, enriquecida y fiel.
-
-${isGal ? `
-*** OBRIGATORIO: LINGUA GALEGA ***
-O informe está en LINGUA GALEGA. Redacta o resumo de auditoría ('summaryAudit'), os erros detectados, as correccións aplicadas, o resumo executivo rectificado ('correctedExecutiveSummary') e os puntos clave ('correctedKeyPoints') ÍNTEGRAMENTE en LINGUA GALEGA formal, normativo e universitario! Está prohibido responder en castelán.
-` : isCat ? `
-*** OBLIGATORI: CATALÀ ***
-Redacta absolutament tot el resultat en català normatiu i formal.
-` : `
-Redacta el informe de auditoría y los campos rectificados en español (castellano) formal y universitario.
-`}
-`;
-
-      const auditPrompt = `
-Contenido actual del análisis a auditar:
-Título: "${analysis.title}"
-Idioma: ${outputLang}
-Resumen Ejecutivo actual:
-${analysis.executiveSummary}
-
-Puntos clave actuales:
-${analysis.keyPoints.map((p, i) => `${i + 1}. ${p}`).join("\n")}
-
-Evidencia oficial contrastada obtenida de la web y registros:
-${groundedEvidence}
-
-Genera un objeto JSON estructurado con la auditoría y la versión completamente rectificada.
-`;
-
-      const auditResponseSchema = {
-        type: Type.OBJECT,
-        properties: {
-          status: { type: Type.STRING, description: "'corrected' si se detectaron y corrigieron errores/omisiones; 'verified' si todo era 100% exacto." },
-          verdictTitle: { type: Type.STRING, description: "Título sintético del informe de contraste (en el idioma del informe, p. ej. 'Informe de contraste de datos: Verificación con fontes oficiais')." },
-          summaryAudit: { type: Type.STRING, description: "Informe analítico exhaustivo que contrasta cada dato analizado con las fuentes más fiables posibles (en el idioma del informe)." },
-          detectedErrors: { 
-            type: Type.ARRAY, 
-            items: { type: Type.STRING },
-            description: "Lista de errores fácticos, fechas inexactas, cifras erróneas o candidatos omitidos que se han detectado."
-          },
-          correctionsApplied: { 
-            type: Type.ARRAY, 
-            items: { type: Type.STRING },
-            description: "Lista de rectificaciones aplicadas con datos contrastados oficiales."
-          },
-          contrastTable: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                claimOrFact: { type: Type.STRING, description: "El dato, fecha, resultado electoral o afirmación que figuraba inicialmente." },
-                officialVerification: { type: Type.STRING, description: "El dato real y contrastado según las fuentes oficiales y fiables más reputadas." },
-                status: { type: Type.STRING, description: "'corrected' si requirió corrección, 'verified' si era correcto, 'clarified' si fue ampliado o matizado." },
-                reliableSource: { type: Type.STRING, description: "Nombre del organismo oficial o fuente fiable consultada (ej. 'Ministerio del Interior / Archivo Electoral', 'Junta Electoral Central', 'INE', 'BOE/DOG', 'Hemeroteca Oficial')." },
-                sourceUrl: { type: Type.STRING, description: "URL o referencia oficial consultada." }
-              },
-              required: ["claimOrFact", "officialVerification", "status", "reliableSource"]
-            },
-            description: "Matriz comparativa de contraste dato por dato para que el usuario no tenga que buscar las fuentes."
-          },
-          correctedExecutiveSummary: { type: Type.STRING, description: "Resumen ejecutivo completamente rectificado, exacto, enriquecido y sin falsedades históricas (en el idioma del informe)." },
-          correctedKeyPoints: { 
-            type: Type.ARRAY, 
-            items: { type: Type.STRING },
-            description: "Lista de 5 a 8 puntos clave rectificados y contrastados (en el idioma del informe)."
-          },
-          correctedNumericalExamples: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                concept: { type: Type.STRING },
-                figureOrCost: { type: Type.STRING },
-                explanation: { type: Type.STRING }
-              },
-              required: ["concept", "figureOrCost", "explanation"]
-            },
-            description: "Ejemplos numéricos con cifras, votos y escaños oficiales contrastados."
-          }
-        },
-        required: ["status", "summaryAudit", "detectedErrors", "correctionsApplied", "correctedExecutiveSummary", "correctedKeyPoints"]
+      const deps: AuditDeps = {
+        llmJson: (prompt, system, schema) => generateAnalysisContentWithRetry(prompt, system, schema, false),
+        groundedSearch: (prompt) => generateGroundedSearchText(prompt, undefined, { strict: true }),
       };
 
-      const auditResultRaw = await generateAnalysisContentWithRetry(
-        auditPrompt,
-        auditSystemInstruction,
-        auditResponseSchema,
-        false
-      );
+      const outcome = await runClaimAudit(deps, {
+        title: analysis.title,
+        lang: outputLang,
+        sourceText: analysis.originalExtractedText,
+        summary: analysis.executiveSummary,
+        keyPoints: analysis.keyPoints,
+      });
 
-      const auditData = cleanJsonParse(auditResultRaw);
-
-      // Apply updates to the analysis
-      analysis.executiveSummary = auditData.correctedExecutiveSummary || analysis.executiveSummary;
-      analysis.keyPoints = auditData.correctedKeyPoints || analysis.keyPoints;
-      if (auditData.correctedNumericalExamples && auditData.correctedNumericalExamples.length > 0) {
-        analysis.numericalExamples = auditData.correctedNumericalExamples;
+      // Solo se reescribe el resumen con correcciones fuertes (contradichas, confianza >= 0.7, con fuente real).
+      // El texto previo se conserva para poder revertir.
+      let applied: string[] = [];
+      let previousExecutiveSummary = analysis.factCheckAudit?.previousExecutiveSummary;
+      let previousKeyPoints = analysis.factCheckAudit?.previousKeyPoints;
+      if (outcome.strongCorrections.length > 0) {
+        const rewritten = await rewriteWithCorrections(deps, {
+          summary: analysis.executiveSummary,
+          keyPoints: analysis.keyPoints,
+          corrections: outcome.strongCorrections,
+          lang: outputLang,
+        });
+        if (rewritten) {
+          previousExecutiveSummary = previousExecutiveSummary ?? analysis.executiveSummary;
+          previousKeyPoints = previousKeyPoints ?? analysis.keyPoints;
+          analysis.executiveSummary = rewritten.executiveSummary;
+          analysis.keyPoints = rewritten.keyPoints;
+          applied = outcome.strongCorrections;
+        }
       }
 
       analysis.factCheckAudit = {
         auditedAt: new Date().toISOString(),
-        status: auditData.status === "verified" ? "verified" : "corrected",
-        verdictTitle: auditData.verdictTitle || (isGal ? "Informe de contraste e verificación con fontes fiables" : "Informe de contraste y verificación con fuentes fiables"),
-        summaryAudit: auditData.summaryAudit,
-        detectedErrors: auditData.detectedErrors || [],
-        correctionsApplied: auditData.correctionsApplied || [],
-        contrastTable: auditData.contrastTable || [],
-        verifiedSources: sources.length > 0 ? sources : [
-          { title: "Bases de Datos Oficiales y Archivo Histórico Electoral (Infoelectoral)", url: "https://infoelectoral.interior.gob.es/", reliability: "Base Oficial del Estado" },
-          { title: "Junta Electoral Central (JEC)", url: "https://www.juntaelectoralcentral.es/", reliability: "Órgano Oficial" }
-        ]
+        status: outcome.status,
+        verdictTitle: outcome.verdictTitle,
+        summaryAudit: outcome.summaryAudit,
+        detectedErrors: [],
+        correctionsApplied: applied,
+        verifiedSources: outcome.verifiedSources,
+        method: "claim_level_v2",
+        auditedFrom: outcome.auditedFrom,
+        claimChecks: outcome.claimChecks,
+        counts: outcome.counts,
+        coverage: outcome.coverage,
+        previousExecutiveSummary,
+        previousKeyPoints,
       };
 
       saveDatabase(db);
@@ -1736,6 +1673,9 @@ Genera la versión corregida y el resumen de cambios aplicados.
   app.post("/api/analyses/:id/restore", (req, res) => {
     const { id } = req.params;
     if (db[id]) return res.json(db[id]);
+    if (Object.keys(db).length >= (Number(process.env.MAX_STORED_ANALYSES) || 500)) {
+      return res.status(507).json({ error: "Almacén lleno: borra análisis antiguos antes de restaurar más." });
+    }
     const a = req.body;
     const valid =
       a && typeof a === "object" && a.id === id &&
