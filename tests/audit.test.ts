@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { applyGuards, locateFragment, runClaimAudit, rewriteWithCorrections, type AuditDeps } from "../server/audit";
+import { applyGuards, locateFragment, runClaimAudit as runRaw, rewriteWithCorrections, sanitizeError, type AuditDeps } from "../server/audit";
+const runClaimAudit = (d: AuditDeps, i: any) => runRaw(d, i, { retryDelayMs: 0 });
 
 const ARTICLE =
   "El reciente premio Nobel de Medicina ha recaído en Demis Hassabis, lo que muestra el avance de la IA. " +
@@ -38,7 +39,7 @@ function makeDeps(opts: { searchCalls?: string[]; judge?: (items: string) => any
       if (prompt.includes("Hassabis"))
         return { text: "Demis Hassabis y John Jumper recibieron el Premio Nobel de Química 2024 junto con David Baker.", sources: [{ title: "NobelPrize.org", url: "https://nobelprize.org/a" }, { title: "NobelPrize.org (dup)", url: "https://nobelprize.org/a" }, { title: "Nature", url: "https://nature.com/b" }] };
       if (prompt.includes("Goldman")) return { text: "Goldman Sachs estimó que unos 300 millones de empleos a tiempo completo podrían verse afectados.", sources: [{ title: "Goldman", url: "https://goldman.com/x" }] };
-      return { text: "EVIDENCIA INSUFICIENTE", sources: [], failed: true }; // Amodei: el buscador no devuelve nada
+      return { text: "Amodei compareció ante el Senado de EE. UU. en 2023.", sources: [] }; // texto SIN fuentes reales (el modelo "recuerda")
     },
   };
 }
@@ -150,4 +151,52 @@ test("fragmento real del artículo de Ignacio de la Torre se localiza; el del di
   assert.equal(locateFragment("el reciente premio Nobel de Medicina ha recaído en Demis Hassabis", real), true);
   // el dictamen antiguo atribuía a Amodei su "comparecencia ante el Senado": el artículo habla de una entrevista del Financial Times
   assert.equal(locateFragment("comparecencia ante el Subcomité Judicial del Senado", real), false);
+});
+
+test("fallo técnico de la búsqueda: no se confunde con falta de evidencia ni se dice 'ninguna contradicha'", async () => {
+  let judgeCalls = 0;
+  const deps: AuditDeps = {
+    llmJson: async (_p, system) => {
+      if (system.includes("extrae afirmaciones")) return JSON.stringify({ claims: [claims[0], claims[2]] });
+      judgeCalls++;
+      return JSON.stringify({ results: [] });
+    },
+    groundedSearch: async () => ({ text: "", sources: [], failed: true, error: '{"error":{"code":429,"message":"Quota exceeded for key AIzaSyA1234567890abcdefghijklmnop","status":"RESOURCE_EXHAUSTED"}}' }),
+  };
+  const out = await runClaimAudit(deps, input);
+  assert.equal(judgeCalls, 0, "no se pide juicio al LLM sin evidencia");
+  assert.ok(out.claimChecks.every((c) => c.searchFailed === true && c.verdict === "insufficient_evidence" && c.confidence === 0));
+  assert.equal(out.coverage.searchFailed, 2);
+  assert.equal(out.status, "inconclusive");
+  assert.match(out.summaryAudit, /falló por un error técnico en 2 de 2/);
+  assert.doesNotMatch(out.summaryAudit, /Ninguna afirmación revisada fue contradicha/);
+  assert.doesNotMatch(JSON.stringify(out), /AIzaSy/, "la clave nunca se filtra al informe");
+  assert.match(out.claimChecks[0].explanation, /Quota exceeded/);
+});
+
+test("si la búsqueda falla la primera vez y funciona en el reintento, la afirmación se evalúa con normalidad", async () => {
+  const calls: Record<string, number> = {};
+  const base = makeDeps();
+  const deps: AuditDeps = {
+    ...base,
+    groundedSearch: async (prompt) => {
+      const k = prompt.includes("Hassabis") ? "nobel" : "otra";
+      calls[k] = (calls[k] || 0) + 1;
+      if (k === "nobel" && calls[k] === 1) return { text: "", sources: [], failed: true, error: "429" };
+      return base.groundedSearch(prompt);
+    },
+  };
+  const out = await runClaimAudit(deps, input);
+  assert.equal(calls.nobel, 2);
+  const nobel = out.claimChecks.find((c) => c.claim.includes("Nobel"))!;
+  assert.equal(nobel.verdict, "contradicted");
+  assert.equal(nobel.searchFailed, undefined);
+  assert.equal(out.coverage.searchFailed, 0);
+});
+
+test("sanitizeError extrae el mensaje JSON, oculta claves y acota la longitud", () => {
+  assert.equal(sanitizeError('{"error":{"message":"cuota agotada"}}'), "cuota agotada");
+  assert.doesNotMatch(sanitizeError("fallo con AIzaSyA1234567890abcdefghijklmnop dentro"), /AIza/);
+  assert.ok(sanitizeError("x".repeat(1000)).length <= 200);
+  assert.equal(sanitizeError(undefined), "error desconocido");
 });

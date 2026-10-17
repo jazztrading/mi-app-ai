@@ -24,7 +24,7 @@ test("REQUIRE_AUTH=false deja pasar sin credencial; cualquier otro valor la sigu
   let passed = false;
   requireAuth(mkReq(), mkRes(), () => (passed = true));
   assert.equal(passed, true);
-  for (const v of ["true", "0", "FALSE", "no", ""]) {
+  for (const v of ["true", "0", "no", "off", "", " "]) {
     process.env.REQUIRE_AUTH = v; process.env.APP_ACCESS_TOKEN = "x".repeat(20);
     const res = mkRes(); let p2 = false;
     requireAuth(mkReq(), res, () => (p2 = true));
@@ -32,6 +32,16 @@ test("REQUIRE_AUTH=false deja pasar sin credencial; cualquier otro valor la sigu
     assert.equal(res.code, 401);
   }
   delete process.env.REQUIRE_AUTH; delete process.env.APP_ACCESS_TOKEN;
+});
+
+test("REQUIRE_AUTH=false se acepta con mayúsculas o espacios (error típico al escribirlo en Render)", () => {
+  for (const v of ["false", "False", "FALSE", " false ", "false\n"]) {
+    process.env.REQUIRE_AUTH = v;
+    let passed = false;
+    requireAuth(mkReq(), mkRes(), () => (passed = true));
+    assert.equal(passed, true, JSON.stringify(v));
+  }
+  delete process.env.REQUIRE_AUTH;
 });
 
 test("el tope diario global corta en el límite, sin importar la IP", () => {
