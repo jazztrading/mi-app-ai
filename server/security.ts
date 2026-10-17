@@ -23,8 +23,8 @@ export const MAX_TEXT_CHARS = intEnv("MAX_TEXT_CHARS", 200_000);
 // ── Autenticación por token compartido ───────────────────────────────────────
 const sha256 = (s: string) => crypto.createHash("sha256").update(s).digest();
 
-/** REQUIRE_AUTH=false desactiva la clave de acceso (cualquiera con la URL puede usar la app). Por defecto: exigida. */
-export const isAuthRequired = () => process.env.REQUIRE_AUTH !== "false";
+/** REQUIRE_AUTH=false (sin distinguir mayúsculas ni espacios) desactiva la clave. Cualquier otro valor o su ausencia: exigida. */
+export const isAuthRequired = () => (process.env.REQUIRE_AUTH ?? "").trim().toLowerCase() !== "false";
 
 /** Falla cerrado: si la clave es obligatoria y APP_ACCESS_TOKEN no está definido, la API protegida responde 503. */
 export function requireAuth(req: Request, res: Response, next: NextFunction) {
