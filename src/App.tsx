@@ -1969,12 +1969,12 @@ export default function App() {
                             className="p-4 sm:p-5 bg-emerald-900/70 border border-emerald-800/90 rounded-xl space-y-3 flex flex-col justify-between overflow-hidden shadow-xs hover:border-emerald-700/80 transition-all"
                           >
                             <div className="space-y-2.5 min-w-0">
-                              <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-2.5">
+                              <div className="flex flex-col gap-2">
                                 <span className="text-xs font-semibold text-emerald-200 leading-snug break-words font-display min-w-0">
                                   {item.concept}
                                 </span>
-                                <div className="self-start sm:self-auto shrink-0 max-w-full">
-                                  <span className="inline-block text-xs font-mono font-bold text-amber-300 bg-amber-950/90 border border-amber-700/70 px-2.5 py-1 rounded-md shadow-2xs break-words whitespace-normal text-left sm:text-right max-w-full leading-relaxed">
+                                <div className="self-start max-w-full">
+                                  <span className="inline-block text-xs font-mono font-bold text-amber-300 bg-amber-950/90 border border-amber-700/70 px-2.5 py-1 rounded-md shadow-2xs break-words whitespace-normal text-left max-w-full leading-relaxed">
                                     {item.figureOrCost}
                                   </span>
                                 </div>
