@@ -117,7 +117,7 @@ export interface FactCheckAudit {
   auditedFrom?: "original_text" | "summary_only";
   claimChecks?: ClaimCheck[];
   counts?: Record<ClaimVerdict, number>;
-  coverage?: { extracted: number; considered: number; searched: number; notCheckable: number; textTruncated: boolean; maxClaims: number };
+  coverage?: { extracted: number; considered: number; searched: number; notCheckable: number; textTruncated: boolean; maxClaims: number; searchFailed?: number };
   previousExecutiveSummary?: string;
   previousKeyPoints?: string[];
 }
@@ -594,7 +594,7 @@ async function generateGroundedSearchText(
   prompt: string,
   systemInstruction?: string,
   opts?: { strict?: boolean } // strict: sin URLs sacadas del texto del modelo ni respaldo sin búsqueda
-): Promise<{ text: string; sources: Array<{ title: string; url: string; snippet?: string }>; failed?: boolean }> {
+): Promise<{ text: string; sources: Array<{ title: string; url: string; snippet?: string }>; failed?: boolean; error?: string }> {
   const models = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"];
   let lastErr: any = null;
 
@@ -656,7 +656,11 @@ async function generateGroundedSearchText(
   }
 
   // En modo estricto no se sustituye la búsqueda por texto generado de memoria: se avisa del fallo.
-  if (opts?.strict) return { text: "", sources: [], failed: true };
+  if (opts?.strict) {
+    const reason = String(lastErr?.message || "respuesta vacía del buscador").slice(0, 300);
+    console.warn(`[Gemini Grounded Search] Falló en todos los modelos: ${reason}`);
+    return { text: "", sources: [], failed: true, error: reason };
+  }
 
   // Fallback to text generation if grounded tool failed
   try {
@@ -680,7 +684,7 @@ async function startServer() {
   app.use(securityHeaders);
 
   // Único endpoint público (sin datos): comprobación de salud para Render
-  app.get("/api/health", (_req, res) => res.json({ ok: true }));
+  app.get("/api/health", (_req, res) => res.json({ ok: true, authRequired: isAuthRequired() }));
 
   // Todo lo demás bajo /api exige credencial; los intentos fallidos se limitan por IP
   app.use("/api", failedAuthLimiter, requireAuth, apiLimiter);
