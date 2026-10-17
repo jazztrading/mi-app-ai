@@ -124,9 +124,39 @@ interface DataContrastItem {
   sourceUrl?: string;
 }
 
+type ClaimVerdict = "supported" | "contradicted" | "partially_supported" | "insufficient_evidence" | "not_checkable";
+
+interface ClaimCheck {
+  id: string;
+  claim: string;
+  quote: string;
+  quoteLocated: boolean;
+  claimType: "fact" | "quantitative" | "attribution" | "prediction" | "opinion";
+  verdict: ClaimVerdict;
+  confidence: number;
+  explanation: string;
+  correction?: string;
+  evidenceQuote?: string;
+  evidence: Array<{ title: string; url: string }>;
+}
+
+const CLAIM_VERDICT_UI: Record<ClaimVerdict, { label: string; chip: string }> = {
+  supported: { label: "Respaldada", chip: "bg-emerald-100 text-emerald-900 border-emerald-300" },
+  contradicted: { label: "Contradicha", chip: "bg-rose-100 text-rose-900 border-rose-300" },
+  partially_supported: { label: "Parcialmente respaldada", chip: "bg-amber-100 text-amber-900 border-amber-300" },
+  insufficient_evidence: { label: "Evidencia insuficiente", chip: "bg-slate-100 text-slate-700 border-slate-300" },
+  not_checkable: { label: "No comprobable (opinión o predicción)", chip: "bg-slate-50 text-slate-500 border-slate-200" },
+};
+
 interface FactCheckAudit {
   auditedAt: string;
-  status: "verified" | "corrected";
+  status: "verified" | "corrected" | "inconclusive";
+  method?: "claim_level_v2";
+  auditedFrom?: "original_text" | "summary_only";
+  claimChecks?: ClaimCheck[];
+  counts?: Record<ClaimVerdict, number>;
+  previousExecutiveSummary?: string;
+  previousKeyPoints?: string[];
   verdictTitle?: string;
   summaryAudit: string;
   detectedErrors: string[];
@@ -1644,7 +1674,9 @@ export default function App() {
                             <h4 className="font-display font-bold text-base text-slate-900 flex flex-wrap items-center gap-2">
                               <span>{selectedAnalysis.factCheckAudit.verdictTitle || "Informe de Contraste e Verificación de Datos"}</span>
                               <span className="text-[10px] font-mono px-2.5 py-0.5 rounded-full font-bold bg-emerald-100 text-emerald-800 border border-emerald-200">
-                                {selectedAnalysis.factCheckAudit.status === "corrected" ? "✓ Datos Rectificados con Fontes Oficiais" : "✓ 100% Contrastado"}
+                                {selectedAnalysis.factCheckAudit.method === "claim_level_v2" && selectedAnalysis.factCheckAudit.counts
+                                  ? `${selectedAnalysis.factCheckAudit.counts.supported} respaldadas · ${selectedAnalysis.factCheckAudit.counts.contradicted + selectedAnalysis.factCheckAudit.counts.partially_supported} con errores · ${selectedAnalysis.factCheckAudit.counts.insufficient_evidence} sin evidencia suficiente`
+                                  : "Auditoría anterior (sin detalle por afirmación)"}
                               </span>
                             </h4>
                             <span className="text-[11px] text-slate-500 font-mono">
@@ -1675,6 +1707,61 @@ export default function App() {
                           {selectedAnalysis.factCheckAudit.summaryAudit}
                         </p>
                       </div>
+
+                      {/* Auditoría v2: afirmaciones comprobadas una a una */}
+                      {selectedAnalysis.factCheckAudit.claimChecks && selectedAnalysis.factCheckAudit.claimChecks.length > 0 && (
+                        <div className="mb-4 bg-white rounded-xl border border-slate-200 overflow-hidden shadow-2xs">
+                          <div className="bg-slate-100/80 px-4 py-2.5 border-b border-slate-200 flex items-center justify-between">
+                            <span className="text-xs font-bold font-display text-slate-900 flex items-center gap-1.5">
+                              <Scale className="w-4 h-4 text-slate-600" />
+                              Afirmaciones auditadas una a una
+                            </span>
+                            <span className="text-[10.5px] font-mono font-semibold text-slate-700 bg-slate-200/70 px-2 py-0.5 rounded">
+                              {selectedAnalysis.factCheckAudit.claimChecks.length} afirmaciones
+                            </span>
+                          </div>
+                          <div className="divide-y divide-slate-100 text-xs">
+                            {selectedAnalysis.factCheckAudit.claimChecks.map((c) => (
+                              <div key={c.id} className="p-3.5 space-y-2">
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                  <span className={`text-[10.5px] font-bold px-2 py-0.5 rounded-full font-mono border ${CLAIM_VERDICT_UI[c.verdict].chip}`}>
+                                    {CLAIM_VERDICT_UI[c.verdict].label}
+                                  </span>
+                                  {c.verdict !== "not_checkable" && (
+                                    <span className="text-[10.5px] font-mono text-slate-500">confianza {c.confidence.toFixed(2)}</span>
+                                  )}
+                                </div>
+                                <p className="text-slate-800 font-semibold leading-snug">{c.claim}</p>
+                                {c.quoteLocated && c.quote && (
+                                  <p className="text-[11.5px] text-slate-500 italic leading-snug">«{c.quote}»</p>
+                                )}
+                                <p className="text-slate-700 leading-snug">{c.explanation}</p>
+                                {c.correction && (
+                                  <div className="p-2.5 bg-rose-50/70 border border-rose-200 rounded-lg">
+                                    <span className="text-[10px] font-bold text-rose-800 uppercase block mb-1">Dato según las fuentes:</span>
+                                    <p className="text-slate-800 font-semibold leading-snug">{c.correction}</p>
+                                  </div>
+                                )}
+                                {c.evidenceQuote && (
+                                  <p className="text-[11.5px] text-slate-500 leading-snug">Evidencia: «{c.evidenceQuote}»</p>
+                                )}
+                                {c.evidence.length > 0 && (
+                                  <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11px]">
+                                    {c.evidence
+                                      .filter((src) => /^https?:\/\//.test(src.url))
+                                      .map((src, i) => (
+                                        <a key={i} href={src.url} target="_blank" rel="noreferrer" className="text-emerald-700 hover:text-emerald-900 underline flex items-center gap-1">
+                                          <span>{src.title || "Fuente"}</span>
+                                          <ExternalLink className="w-2.5 h-2.5" />
+                                        </a>
+                                      ))}
+                                  </div>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
 
                       {/* Interactive Contrast Matrix / Cadro Comparativo */}
                       {selectedAnalysis.factCheckAudit.contrastTable && selectedAnalysis.factCheckAudit.contrastTable.length > 0 && (
