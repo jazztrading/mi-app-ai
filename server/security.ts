@@ -23,8 +23,12 @@ export const MAX_TEXT_CHARS = intEnv("MAX_TEXT_CHARS", 200_000);
 // ── Autenticación por token compartido ───────────────────────────────────────
 const sha256 = (s: string) => crypto.createHash("sha256").update(s).digest();
 
-/** Falla cerrado: si APP_ACCESS_TOKEN no está definido, la API protegida responde 503. */
+/** REQUIRE_AUTH=false desactiva la clave de acceso (cualquiera con la URL puede usar la app). Por defecto: exigida. */
+export const isAuthRequired = () => process.env.REQUIRE_AUTH !== "false";
+
+/** Falla cerrado: si la clave es obligatoria y APP_ACCESS_TOKEN no está definido, la API protegida responde 503. */
 export function requireAuth(req: Request, res: Response, next: NextFunction) {
+  if (!isAuthRequired()) return next();
   const expected = process.env.APP_ACCESS_TOKEN;
   if (!expected || expected.length < 16) {
     return res.status(503).json({ error: "Servidor sin credencial configurada (APP_ACCESS_TOKEN, mínimo 16 caracteres)." });
@@ -64,6 +68,31 @@ export const costlyLimiter = rateLimit({
   limit: intEnv("RL_COSTLY_MAX", 15),
   message: { error: "Límite horario de análisis alcanzado. Inténtalo más tarde." },
 });
+
+/**
+ * Tope GLOBAL diario (todas las IP juntas) de operaciones que gastan cuota de Gemini. Es la red de seguridad cuando
+ * no hay clave: limita el gasto máximo aunque el atacante cambie de IP. Se guarda en memoria, así que se reinicia
+ * si el servidor se reinicia; el tope mensual de Google AI Studio sigue siendo la protección real.
+ */
+let capDay = "";
+let capCount = 0;
+export const dailyCostlyMax = () => intEnv("DAILY_COSTLY_MAX", 60);
+export function dailyCostlyCap(_req: Request, res: Response, next: NextFunction) {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== capDay) {
+    capDay = today;
+    capCount = 0;
+  }
+  if (capCount >= dailyCostlyMax()) {
+    return res.status(429).json({ error: `Límite diario global de análisis alcanzado (${dailyCostlyMax()}). Vuelve a intentarlo mañana.` });
+  }
+  capCount++;
+  next();
+}
+export function _resetDailyCapForTests() {
+  capDay = "";
+  capCount = 0;
+}
 
 // ── Cabeceras de seguridad mínimas (sin dependencia extra) ───────────────────
 export function securityHeaders(_req: Request, res: Response, next: NextFunction) {
