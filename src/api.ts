@@ -33,11 +33,11 @@ export async function apiFetch(input: string, init: RequestInit = {}): Promise<R
   };
   let token = getToken();
   if (token && !VALID.test(token)) { clearToken(); token = ""; } // descarta una clave guardada que ya era inválida
-  if (!token) token = askToken();
+  // Se intenta primero sin pedir nada: si el servidor tiene la clave desactivada (REQUIRE_AUTH=false) nunca se pregunta.
   let res = await send(token);
   if (res.status === 401) {
     clearToken();
-    token = askToken("Clave incorrecta. Vuelve a escribirla:");
+    token = askToken(token ? "Clave incorrecta. Vuelve a escribirla:" : "Este servidor pide una clave de acceso:");
     if (token) res = await send(token);
   }
   return res;
