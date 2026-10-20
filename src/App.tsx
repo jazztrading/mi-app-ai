@@ -65,8 +65,26 @@ interface VerifiedScholarlyCitation {
   journalOrVenue?: string;
   citationsCount?: number;
   openAccessUrl?: string;
-  isVerified?: boolean;
+  isVerified?: boolean; // obsoleto
+  verificationStatus?: VerificationStatus;
+  supportVerdict?: SupportVerdict;
+  supportQuote?: string;
+  isRetracted?: boolean;
+  hasConcern?: boolean;
+  verificationNotes?: string[];
   link: string;
+}
+
+type VerificationStatus = "exact" | "probable" | "related_unverified" | "not_found";
+type SupportVerdict = "supports" | "contradicts" | "mixed" | "unrelated" | "unassessed";
+
+interface ScoutAssessment {
+  whereAuthorIsRight: string[];
+  strongestVersion: string;
+  implicationsIfTrue: string[];
+  whatWouldChangeTheConclusion: string[];
+  evidenceSufficiency: "suficiente" | "parcial" | "insuficiente";
+  sufficiencyNote?: string;
 }
 
 interface BibliographicSource {
@@ -77,11 +95,18 @@ interface BibliographicSource {
   link: string;
   summary: string;
   criticalAnalysis: string;
-  reliabilityScore: number;
+  reliabilityScore?: number | null; // null = no evaluable
+  reliabilityBasis?: string[];
   academicRigor: string;
   doi?: string;
   journalOrVenue?: string;
-  isVerified?: boolean;
+  isVerified?: boolean; // obsoleto
+  verificationStatus?: VerificationStatus;
+  supportVerdict?: SupportVerdict;
+  supportQuote?: string;
+  isRetracted?: boolean;
+  hasConcern?: boolean;
+  verificationNotes?: string[];
   citationsCount?: number;
   openAccessUrl?: string;
   isRecent?: boolean;
@@ -93,7 +118,12 @@ interface CriticalPosition {
   title: string;
   argument: string;
   scientificBasis: string;
+  targetClaim?: string;
+  critiqueType?: string;
+  evidenceThatWouldSettleIt?: string;
+  suggestedSources?: string[];
   supportingStudy?: VerifiedScholarlyCitation;
+  studyDiscardedNote?: string;
 }
 
 interface ConstructiveDebatesSummary {
@@ -149,6 +179,29 @@ const CLAIM_VERDICT_UI: Record<ClaimVerdict, { label: string; chip: string }> = 
   not_checkable: { label: "No comprobable (opinión o predicción)", chip: "bg-slate-50 text-slate-500 border-slate-200" },
 };
 
+const VERIFICATION_UI: Record<VerificationStatus, { label: string; tone: string }> = {
+  exact: { label: "Cita verificada: la obra existe y coincide con el registro", tone: "text-emerald-800" },
+  probable: { label: "Coincidencia probable con el registro (sin DOI comprobado)", tone: "text-amber-800" },
+  related_unverified: { label: "Lectura relacionada: sugerida por búsqueda automática, NO verificada como fuente de esta afirmación", tone: "text-slate-700" },
+  not_found: { label: "No localizada en registros académicos", tone: "text-rose-800" },
+};
+const SUPPORT_UI: Record<SupportVerdict, string> = {
+  supports: "Su resumen respalda la afirmación",
+  contradicts: "Su resumen contradice la afirmación",
+  mixed: "Su resumen la respalda solo en parte",
+  unrelated: "Su resumen no trata esta afirmación",
+  unassessed: "Respaldo no comprobado (sin resumen disponible o sin prueba literal)",
+};
+const CRITIQUE_TYPE_LABEL: Record<string, string> = {
+  definicion_perimetro: "Definición y perímetro de las cifras",
+  medicion: "Medición",
+  causal: "Causalidad",
+  institucional_contable: "Marco institucional o contable",
+  empirica: "Evidencia empírica",
+  logica: "Lógica del argumento",
+  normativa: "Juicio normativo",
+};
+
 interface FactCheckAudit {
   auditedAt: string;
   status: "verified" | "corrected" | "inconclusive";
@@ -190,7 +243,8 @@ interface AnalysisResult {
   contentType: "blog" | "podcast" | "youtube" | "manual" | "photo" | "document";
   photoUrls?: string[];
   fileNames?: string[];
-  overallReliabilityScore?: number;
+  overallReliabilityScore?: number | null;
+  scoutAssessment?: ScoutAssessment;
   factCheckAudit?: FactCheckAudit;
   isEditedManually?: boolean;
 }
@@ -723,13 +777,15 @@ export default function App() {
   };
 
   // Helper to get score color
-  const getScoreColor = (score: number) => {
+  const getScoreColor = (score?: number | null) => {
+    if (typeof score !== "number") return "text-slate-500 bg-slate-50 border-slate-200";
     if (score >= 80) return "text-emerald-600 bg-emerald-50 border-emerald-200";
     if (score >= 60) return "text-amber-600 bg-amber-50 border-amber-200";
     return "text-rose-600 bg-rose-50 border-rose-200";
   };
 
-  const getProgressBarColor = (score: number) => {
+  const getProgressBarColor = (score?: number | null) => {
+    if (typeof score !== "number") return "bg-slate-300";
     if (score >= 80) return "bg-emerald-600";
     if (score >= 60) return "bg-amber-500";
     return "bg-rose-500";
@@ -807,8 +863,13 @@ export default function App() {
         md += `### Posición ${i + 1}: ${crit.title}\n\n`;
         md += `- **Argumento:** ${crit.argument}\n`;
         md += `- **Fundamento Científico/Empírico:** ${crit.scientificBasis}\n`;
+        if (crit.targetClaim) md += `- **Se refiere a:** «${crit.targetClaim}»\n`;
+        if (crit.evidenceThatWouldSettleIt) md += `- **Qué evidencia lo resolvería:** ${crit.evidenceThatWouldSettleIt}${crit.suggestedSources?.length ? ` (consultar: ${crit.suggestedSources.join("; ")})` : ""}\n`;
+        if (crit.studyDiscardedNote) md += `- _${crit.studyDiscardedNote}_\n`;
         if (crit.supportingStudy) {
-          md += `- **Estudio Empírico Contrastado (Peer-Reviewed):** _${crit.supportingStudy.title}_ — ${crit.supportingStudy.author}${crit.supportingStudy.year ? ` (${crit.supportingStudy.year})` : ""}\n`;
+          md += `- **Estado de la cita:** ${VERIFICATION_UI[crit.supportingStudy.verificationStatus ?? "not_found"].label}${crit.supportingStudy.supportVerdict ? ` · ${SUPPORT_UI[crit.supportingStudy.supportVerdict]}` : ""}\n`;
+          if (crit.supportingStudy.supportQuote) md += `- **Frase del resumen:** «${crit.supportingStudy.supportQuote}»\n`;
+          md += `- **Estudio:** _${crit.supportingStudy.title}_ — ${crit.supportingStudy.author}${crit.supportingStudy.year ? ` (${crit.supportingStudy.year})` : ""}\n`;
           if (crit.supportingStudy.journalOrVenue) md += `  - **Revista / Editorial:** ${crit.supportingStudy.journalOrVenue}\n`;
           if (crit.supportingStudy.doi) md += `  - **DOI Oficial:** [${crit.supportingStudy.doi}](${crit.supportingStudy.doi})\n`;
           if (crit.supportingStudy.citationsCount) md += `  - **Citas Registradas:** ${crit.supportingStudy.citationsCount}\n`;
@@ -867,7 +928,7 @@ export default function App() {
 
     // 9. Fuentes Bibliográficas e Investigación Secundaria Verificada
     if (analysis.bibliographicSources && analysis.bibliographicSources.length > 0) {
-      md += `## Fuentes Bibliográficas e Investigación Secundaria Verificada\n\n`;
+      md += `## Fuentes bibliográficas (con estado de verificación)\n\n`;
       analysis.bibliographicSources.forEach((src, idx) => {
         md += `### ${idx + 1}. ${src.title}\n\n`;
         md += `- **Autor/es:** ${src.author}\n`;
@@ -876,8 +937,9 @@ export default function App() {
         if (src.doi) md += `- **DOI:** [${src.doi}](${src.doi})\n`;
         md += `- **Tipo:** ${src.type}\n`;
         if (src.citationsCount !== undefined && src.citationsCount !== null) md += `- **Citas Registradas:** ${src.citationsCount}\n`;
-        md += `- **Fiabilidad Metodológica:** ${src.reliabilityScore}/100\n`;
-        md += `- **Rigor Académico:** ${src.academicRigor}\n`;
+        md += `- **Estado de la cita:** ${VERIFICATION_UI[src.verificationStatus ?? "not_found"].label}${src.supportVerdict ? ` · ${SUPPORT_UI[src.supportVerdict]}` : ""}\n`;
+        md += `- **Fiabilidad (rúbrica):** ${typeof src.reliabilityScore === "number" ? `${src.reliabilityScore}/100` : "no evaluable"}\n`;
+        md += `- **Base de la valoración:** ${src.academicRigor}\n`;
         if (src.link) md += `- **Búsqueda Google Scholar:** [Ver en Google Scholar](${src.link})\n`;
         md += `\n**Sinopsis y Contribución:**\n${src.summary}\n\n`;
         md += `**Análisis Crítico y Contraste:**\n_${src.criticalAnalysis}_\n\n`;
@@ -1269,7 +1331,8 @@ export default function App() {
                   </div>
                 ) : (
                   analyses.map((item) => {
-                    const itemScore = item.overallReliabilityScore ?? (item.bibliographicSources?.length ? Math.round(item.bibliographicSources.reduce((acc, s) => acc + (s.reliabilityScore || 0), 0) / item.bibliographicSources.length) : 85);
+                    const scoredSrc = (item.bibliographicSources || []).filter((x) => typeof x.reliabilityScore === "number") as Array<BibliographicSource & { reliabilityScore: number }>;
+                    const itemScore: number | null = typeof item.overallReliabilityScore === "number" ? item.overallReliabilityScore : (scoredSrc.length ? Math.round(scoredSrc.reduce((acc, x) => acc + x.reliabilityScore, 0) / scoredSrc.length) : null);
                     return (
                     <div
                       key={item.id}
@@ -1296,9 +1359,11 @@ export default function App() {
                               <span className="text-[10px] font-mono text-indigo-600 bg-indigo-50 border border-indigo-100 px-1.5 py-0.2 rounded-full font-medium">
                                 {item.originalLanguage.toUpperCase()}
                               </span>
-                              <span className="text-[10px] font-mono text-slate-500 bg-slate-100 px-1.5 py-0.2 rounded-full font-medium">
-                                Score: {itemScore}/100
-                              </span>
+                              {itemScore !== null && (
+                                <span className="text-[10px] font-mono text-slate-500 bg-slate-100 px-1.5 py-0.2 rounded-full font-medium" title="Media de la fiabilidad de las fuentes verificadas">
+                                  Fuentes: {itemScore}/100
+                                </span>
+                              )}
                             </div>
                           </div>
                         </div>
@@ -2078,6 +2143,53 @@ export default function App() {
                     </div>
                   )}
 
+                  {/* Evaluación de explorador: antes de criticar, lo que acierta el autor y qué cambiaría la conclusión */}
+                  {selectedAnalysis.scoutAssessment && (
+                    <div className="bg-white border border-sky-200/80 rounded-xl p-6 shadow-xs">
+                      <div className="flex items-center justify-between gap-2 mb-4 pb-3 border-b border-sky-100">
+                        <h3 className="text-lg font-display font-semibold text-slate-900 flex items-center gap-2">
+                          <Scale className="w-5 h-5 text-sky-600" />
+                          Lectura de explorador
+                        </h3>
+                        <span className={`text-[10px] font-mono font-semibold px-2.5 py-0.5 rounded-full border ${
+                          selectedAnalysis.scoutAssessment.evidenceSufficiency === "suficiente" ? "text-emerald-700 bg-emerald-50 border-emerald-200"
+                          : selectedAnalysis.scoutAssessment.evidenceSufficiency === "parcial" ? "text-amber-700 bg-amber-50 border-amber-200"
+                          : "text-rose-700 bg-rose-50 border-rose-200"}`}>
+                          Evidencia {selectedAnalysis.scoutAssessment.evidenceSufficiency}
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-5 text-xs text-slate-700 leading-snug">
+                        {selectedAnalysis.scoutAssessment.whereAuthorIsRight.length > 0 && (
+                          <div>
+                            <h4 className="font-semibold text-slate-900 mb-1.5">Dónde acierta el texto</h4>
+                            <ul className="list-disc pl-4 space-y-1">{selectedAnalysis.scoutAssessment.whereAuthorIsRight.map((t, i) => <li key={i}>{t}</li>)}</ul>
+                          </div>
+                        )}
+                        {selectedAnalysis.scoutAssessment.strongestVersion && (
+                          <div>
+                            <h4 className="font-semibold text-slate-900 mb-1.5">La versión más fuerte de su tesis</h4>
+                            <p>{selectedAnalysis.scoutAssessment.strongestVersion}</p>
+                          </div>
+                        )}
+                        {selectedAnalysis.scoutAssessment.implicationsIfTrue.length > 0 && (
+                          <div>
+                            <h4 className="font-semibold text-slate-900 mb-1.5">Si fuera cierto, ¿qué implicaría?</h4>
+                            <ul className="list-disc pl-4 space-y-1">{selectedAnalysis.scoutAssessment.implicationsIfTrue.map((t, i) => <li key={i}>{t}</li>)}</ul>
+                          </div>
+                        )}
+                        {selectedAnalysis.scoutAssessment.whatWouldChangeTheConclusion.length > 0 && (
+                          <div>
+                            <h4 className="font-semibold text-slate-900 mb-1.5">Qué evidencia cambiaría la conclusión</h4>
+                            <ul className="list-disc pl-4 space-y-1">{selectedAnalysis.scoutAssessment.whatWouldChangeTheConclusion.map((t, i) => <li key={i}>{t}</li>)}</ul>
+                          </div>
+                        )}
+                      </div>
+                      {selectedAnalysis.scoutAssessment.sufficiencyNote && (
+                        <p className="mt-3 text-[11.5px] text-slate-500 italic leading-snug">{selectedAnalysis.scoutAssessment.sufficiencyNote}</p>
+                      )}
+                    </div>
+                  )}
+
                   {/* Scientific & Methodological Critical Positions */}
                   {selectedAnalysis.criticalPositions && selectedAnalysis.criticalPositions.length > 0 && (
                     <div className="bg-white border border-rose-200/80 rounded-xl p-6 shadow-xs relative overflow-hidden">
@@ -2118,14 +2230,36 @@ export default function App() {
                               </span>
                             </div>
 
-                            {/* Verified Peer-Reviewed Empirical Study Badge & Reference */}
+                            {crit.targetClaim && (
+                              <p className="text-[11.5px] text-slate-500 italic leading-snug">Se refiere a: «{crit.targetClaim}»</p>
+                            )}
+                            {crit.critiqueType && (
+                              <span className="inline-block text-[10px] font-mono font-semibold text-rose-700 bg-white border border-rose-200 px-2 py-0.5 rounded">
+                                {CRITIQUE_TYPE_LABEL[crit.critiqueType] || crit.critiqueType}
+                              </span>
+                            )}
+                            {crit.evidenceThatWouldSettleIt && (
+                              <div className="p-2.5 bg-white border border-rose-100 rounded-lg text-xs text-slate-700 leading-snug">
+                                <strong className="text-rose-900">Qué evidencia lo resolvería:</strong> {crit.evidenceThatWouldSettleIt}
+                                {crit.suggestedSources && crit.suggestedSources.length > 0 && (
+                                  <span className="block mt-1 text-slate-500">Dónde consultarla (la app no lo ha consultado): {crit.suggestedSources.join(" · ")}</span>
+                                )}
+                              </div>
+                            )}
+                            {crit.studyDiscardedNote && (
+                              <p className="text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1.5 leading-snug">{crit.studyDiscardedNote}</p>
+                            )}
+
+                            {/* Estudio asociado: solo se muestra si existe, coincide y su resumen se ha comprobado frente a esta posición */}
                             {crit.supportingStudy && (
                               <div className="mt-3 p-3 bg-white border border-rose-200/90 rounded-lg text-xs shadow-2xs space-y-2">
                                 <div className="flex flex-wrap items-center justify-between gap-2 pb-1.5 border-b border-slate-100">
-                                  <div className="flex items-center gap-1.5 text-emerald-800 font-medium">
-                                    <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0" />
-                                    <span className="font-mono text-[11px] font-bold text-emerald-800">
-                                      Evidencia Empírica Contrastada en Registro Científico
+                                  <div className={`flex items-center gap-1.5 font-medium ${VERIFICATION_UI[crit.supportingStudy.verificationStatus ?? "not_found"].tone}`}>
+                                    <ShieldCheck className="w-4 h-4 shrink-0" />
+                                    <span className="font-mono text-[11px] font-bold">
+                                      {crit.supportingStudy.verificationStatus
+                                        ? VERIFICATION_UI[crit.supportingStudy.verificationStatus].label
+                                        : "Verificación anterior (no fiable): se hizo sin comprobar que la obra coincida ni que respalde la posición"}
                                     </span>
                                   </div>
                                   {crit.supportingStudy.citationsCount !== undefined && crit.supportingStudy.citationsCount !== null && (
@@ -2142,9 +2276,17 @@ export default function App() {
                                   <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-slate-500 mt-1">
                                     <span>Autor/es: <strong className="text-slate-700 font-semibold">{crit.supportingStudy.author}</strong></span>
                                     {crit.supportingStudy.year && <span>Año: <strong>{crit.supportingStudy.year}</strong></span>}
+                                    {crit.supportingStudy.isRetracted && <span className="font-bold text-rose-700">RETRACTADA</span>}
                                     {crit.supportingStudy.journalOrVenue && <span>Revista: <strong className="italic text-slate-700">{crit.supportingStudy.journalOrVenue}</strong></span>}
                                   </div>
                                 </div>
+
+                                {crit.supportingStudy.supportVerdict && (
+                                  <p className="text-[11px] text-slate-600 leading-snug">
+                                    <strong className="text-slate-800">{SUPPORT_UI[crit.supportingStudy.supportVerdict]}.</strong>
+                                    {crit.supportingStudy.supportQuote && <span className="italic"> «{crit.supportingStudy.supportQuote}»</span>}
+                                  </p>
+                                )}
 
                                 <div className="flex flex-wrap items-center gap-2 pt-1">
                                   {crit.supportingStudy.doi && (
@@ -2501,7 +2643,7 @@ export default function App() {
                       <div className="h-60">
                         <ResponsiveContainer width="100%" height="100%">
                           <BarChart
-                            data={selectedAnalysis.bibliographicSources}
+                            data={selectedAnalysis.bibliographicSources.filter((x) => typeof x.reliabilityScore === "number")}
                             margin={{ top: 10, right: 10, left: -20, bottom: 5 }}
                           >
                             <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
@@ -2533,10 +2675,10 @@ export default function App() {
                               }}
                             />
                             <Bar dataKey="reliabilityScore" radius={[4, 4, 0, 0]} maxBarSize={45}>
-                              {selectedAnalysis.bibliographicSources.map((entry, index) => (
+                              {selectedAnalysis.bibliographicSources.filter((x) => typeof x.reliabilityScore === "number").map((entry, index) => (
                                 <Cell 
                                   key={`cell-${index}`} 
-                                  fill={entry.reliabilityScore >= 80 ? "#10b981" : entry.reliabilityScore >= 60 ? "#f59e0b" : "#f43f5e"} 
+                                  fill={(entry.reliabilityScore as number) >= 80 ? "#10b981" : (entry.reliabilityScore as number) >= 60 ? "#f59e0b" : "#f43f5e"} 
                                 />
                               ))}
                             </Bar>
@@ -2563,25 +2705,16 @@ export default function App() {
                                     {source.type}
                                   </span>
                                   
-                                  {/* Currency / Recency Badge */}
-                                  {isModern ? (
-                                    <span className="text-[10px] font-mono font-bold text-emerald-800 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded flex items-center gap-1">
-                                      <Sparkles className="w-3 h-3 text-emerald-600" />
-                                      Datos Actualizados ({source.year || "2021-2026"})
-                                    </span>
-                                  ) : (
-                                    <span className="text-[10px] font-mono font-bold text-amber-900 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded flex items-center gap-1">
-                                      <History className="w-3 h-3 text-amber-600" />
-                                      Hito Histórico Seminal ({source.year})
-                                    </span>
-                                  )}
-
-                                  {source.isVerified !== false && (
-                                    <span className="text-[10px] font-mono font-bold text-teal-700 bg-teal-50 border border-teal-200 px-2 py-0.5 rounded flex items-center gap-1">
-                                      <ShieldCheck className="w-3.5 h-3.5 text-teal-600" />
-                                      Indexado en Repositorio Oficial
-                                    </span>
-                                  )}
+                                  {/* Estado de verificación: el sello solo existe si la obra existe y coincide con el registro */}
+                                  {(() => {
+                                    const st = source.verificationStatus;
+                                    if (st === "exact") return <span className="text-[10px] font-mono font-bold text-teal-700 bg-teal-50 border border-teal-200 px-2 py-0.5 rounded flex items-center gap-1"><ShieldCheck className="w-3.5 h-3.5 text-teal-600" />Verificada: existe y coincide</span>;
+                                    if (st === "probable") return <span className="text-[10px] font-mono font-bold text-amber-800 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded">Coincidencia probable</span>;
+                                    if (st === "not_found") return <span className="text-[10px] font-mono font-bold text-rose-800 bg-rose-50 border border-rose-200 px-2 py-0.5 rounded">No verificada</span>;
+                                    return <span className="text-[10px] font-mono font-bold text-slate-600 bg-slate-100 border border-slate-200 px-2 py-0.5 rounded">Verificación anterior (no fiable)</span>;
+                                  })()}
+                                  {source.year && <span className="text-[10px] font-mono text-slate-600 bg-slate-100 border border-slate-200 px-2 py-0.5 rounded">{source.year}</span>}
+                                  {source.isRetracted && <span className="text-[10px] font-mono font-bold text-white bg-rose-600 px-2 py-0.5 rounded">RETRACTADA</span>}
                                   {source.citationsCount !== undefined && source.citationsCount !== null && (
                                     <span className="text-[10px] font-mono text-slate-600 bg-slate-100 border border-slate-200 px-2 py-0.5 rounded">
                                       {source.citationsCount} citas
@@ -2602,13 +2735,13 @@ export default function App() {
                               {/* Score Display Card */}
                               <div className={`shrink-0 border rounded-lg px-3 py-1.5 flex flex-col items-center justify-center min-w-[100px] ${getScoreColor(source.reliabilityScore)}`}>
                                 <span className="text-xs font-mono font-medium text-slate-500">Fiabilidad</span>
-                                <span className="text-xl font-mono font-bold">{source.reliabilityScore}/100</span>
+                                <span className="text-xl font-mono font-bold">{typeof source.reliabilityScore === "number" ? `${source.reliabilityScore}/100` : "—"}</span>
                               </div>
                             </div>
 
                             {/* Progress bar gauge */}
                             <div className="w-full bg-slate-100 h-1.5 rounded-full overflow-hidden mb-4">
-                              <div className={`h-full ${getProgressBarColor(source.reliabilityScore)} rounded-full`} style={{ width: `${source.reliabilityScore}%` }}></div>
+                              <div className={`h-full ${getProgressBarColor(source.reliabilityScore)} rounded-full`} style={{ width: `${typeof source.reliabilityScore === "number" ? source.reliabilityScore : 0}%` }}></div>
                             </div>
 
                             {/* Currency reason banner */}
@@ -2634,7 +2767,7 @@ export default function App() {
                               <div className="space-y-2">
                                 <h5 className="font-semibold text-slate-800 flex items-center gap-1">
                                   <FileText className="w-3.5 h-3.5 text-slate-500" />
-                                  Sinopsis y Contribución
+                                  Sinopsis y Contribución <span className="font-normal text-slate-400">(redactada por el modelo, no verificada)</span>
                                 </h5>
                                 <p className="text-slate-600 leading-relaxed">{source.summary}</p>
                               </div>
@@ -2642,9 +2775,15 @@ export default function App() {
                               <div className="space-y-2">
                                 <h5 className="font-semibold text-slate-800 flex items-center gap-1">
                                   <Search className="w-3.5 h-3.5 text-indigo-600" />
-                                  Análisis Crítico y Contraste
+                                  Análisis Crítico y Contraste <span className="font-normal text-slate-400">(según el modelo)</span>
                                 </h5>
                                 <p className="text-slate-600 leading-relaxed italic">"{source.criticalAnalysis}"</p>
+                                {source.supportVerdict && (
+                                  <p className={`not-italic text-[11px] leading-snug ${source.supportVerdict === "unrelated" ? "text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1" : "text-slate-500"}`}>
+                                    <strong>Comprobado contra el resumen real de la obra:</strong> {SUPPORT_UI[source.supportVerdict]}.
+                                    {source.supportQuote && <span className="italic"> «{source.supportQuote}»</span>}
+                                  </p>
+                                )}
                               </div>
                             </div>
 
