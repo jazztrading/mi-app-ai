@@ -46,7 +46,7 @@ export interface AuditInput {
 export interface AuditOutcome {
   claimChecks: ClaimCheck[];
   counts: Record<ClaimVerdict, number>;
-  coverage: { extracted: number; considered: number; searched: number; notCheckable: number; textTruncated: boolean; maxClaims: number; searchFailed: number };
+  coverage: { extracted: number; considered: number; searched: number; notCheckable: number; textTruncated: boolean; maxClaims: number; searchFailed: number; quota?: "day" | "minute" };
   auditedFrom: "original_text" | "summary_only";
   status: "verified" | "corrected" | "inconclusive";
   summaryAudit: string;
@@ -157,17 +157,68 @@ Reglas:
 }
 
 // ── 2. evidencia (a ciegas respecto a la afirmación del autor) ───────────────
+export interface GeminiErrorInfo {
+  message: string;
+  code?: number;
+  status?: string;
+  quotaId?: string;
+  model?: string;
+  retryAfterSec?: number;
+  quota?: "day" | "minute" | "other"; // solo si es un error de cuota (429)
+}
+
+/** Extrae de un error de Gemini (JSON, a veces con texto delante) el mensaje, la cuota afectada y cuándo reintentar. */
+export function parseGeminiError(raw: any): GeminiErrorInfo {
+  const text: string = typeof raw === "string" ? raw : raw?.message || "";
+  let j: any = null;
+  for (const candidate of [text, text.slice(Math.max(0, text.indexOf("{")))]) {
+    try {
+      j = JSON.parse(candidate);
+      break;
+    } catch {
+      /* probar la siguiente */
+    }
+  }
+  const err = j?.error;
+  const info: GeminiErrorInfo = { message: String(err?.message || text) };
+  if (err) {
+    info.code = typeof err.code === "number" ? err.code : undefined;
+    info.status = typeof err.status === "string" ? err.status : undefined;
+    for (const d of Array.isArray(err.details) ? err.details : []) {
+      const v = Array.isArray(d?.violations) ? d.violations[0] : null;
+      if (v) {
+        if (typeof v.quotaId === "string") info.quotaId = v.quotaId;
+        if (typeof v.quotaDimensions?.model === "string") info.model = v.quotaDimensions.model;
+      }
+      if (typeof d?.retryDelay === "string") {
+        const n = parseFloat(d.retryDelay);
+        if (Number.isFinite(n)) info.retryAfterSec = n;
+      }
+    }
+  }
+  const is429 = info.code === 429 || info.status === "RESOURCE_EXHAUSTED" || /\b429\b|RESOURCE_EXHAUSTED/.test(text);
+  if (is429) {
+    if (/PerDay/i.test(info.quotaId || "") || /per day/i.test(info.message)) info.quota = "day";
+    else if (/PerMinute/i.test(info.quotaId || "") || /per minute/i.test(info.message)) info.quota = "minute";
+    else info.quota = "other";
+  }
+  return info;
+}
+
 /** Mensaje de error corto y sin secretos, apto para mostrar al usuario. */
 export function sanitizeError(raw: any): string {
-  let msg = typeof raw === "string" ? raw : raw?.message || "";
-  try {
-    const j = JSON.parse(msg);
-    if (j?.error?.message) msg = String(j.error.message);
-  } catch {
-    /* no era JSON */
-  }
-  msg = msg.replace(/AIza[0-9A-Za-z_\-]{20,}/g, "[clave]").replace(/\s+/g, " ").trim();
-  return msg.slice(0, 200) || "error desconocido";
+  const info = parseGeminiError(raw);
+  let msg = info.message.replace(/AIza[0-9A-Za-z_\-]{20,}/g, "[clave]").replace(/\s+/g, " ").trim();
+  const dot = msg.indexOf(". ");
+  if (info.quota && dot > 0) msg = msg.slice(0, dot); // primera frase: el resto es enlaces
+  msg = msg.slice(0, 160);
+  const extra: string[] = [];
+  if (info.quotaId) extra.push(`cuota: ${info.quotaId}`);
+  if (info.model) extra.push(`modelo: ${info.model}`);
+  if (info.quota === "day") extra.push("límite diario: se reinicia a medianoche, hora del Pacífico");
+  else if (info.quota === "minute") extra.push("límite por minuto");
+  if (info.retryAfterSec !== undefined) extra.push(`reintentar en ~${Math.ceil(info.retryAfterSec)} s`);
+  return (extra.length ? `${msg} [${extra.join(" · ")}]` : msg).slice(0, 320) || "error desconocido";
 }
 
 interface Evidence {
@@ -175,6 +226,8 @@ interface Evidence {
   sources: Array<{ title: string; url: string }>;
   failed: boolean;
   error?: string;
+  quota?: "day" | "minute" | "other";
+  retryAfterSec?: number;
 }
 
 async function searchEvidence(deps: AuditDeps, question: string): Promise<Evidence> {
@@ -187,12 +240,16 @@ Instrucciones:
 - No asumas que ninguna afirmación previa sea cierta. No escribas URLs: las fuentes se registran aparte.`;
   try {
     const r = await deps.groundedSearch(prompt);
-    if (r.failed) return { text: "", sources: [], failed: true, error: sanitizeError(r.error || "el buscador no respondió") };
+    if (r.failed) {
+      const info = parseGeminiError(r.error || "el buscador no respondió");
+      return { text: "", sources: [], failed: true, error: sanitizeError(r.error || "el buscador no respondió"), quota: info.quota, retryAfterSec: info.retryAfterSec };
+    }
     const text = (r.text || "").slice(0, 2500);
     if (!text.trim()) return { text: "", sources: [], failed: true, error: "respuesta vacía del buscador" };
     return { text, sources: r.sources || [], failed: false };
   } catch (e: any) {
-    return { text: "", sources: [], failed: true, error: sanitizeError(e) };
+    const info = parseGeminiError(e);
+    return { text: "", sources: [], failed: true, error: sanitizeError(e), quota: info.quota, retryAfterSec: info.retryAfterSec };
   }
 }
 
@@ -281,6 +338,7 @@ const T: Record<string, Record<string, string>> = {
     failExplain: "Falló la búsqueda de evidencia ({err}). Esto no significa que no exista evidencia: vuelve a intentarlo más tarde.",
     failNote: "AVISO: la búsqueda de evidencia falló por un error técnico en {f} de {n} afirmaciones comprobables; ese resultado NO indica ausencia de evidencia. Vuelve a intentarlo más tarde.",
     failedCount: "{f} sin comprobar por fallo de búsqueda.",
+    quotaDay: "CUOTA DIARIA DE GEMINI AGOTADA: Google limita las peticiones por proyecto y por día, y se reinicia a medianoche (hora del Pacífico). No se han gastado más peticiones en este informe. Vuelve a auditar después o consulta el panel de límites de AI Studio.",
   },
   galego: {
     title: "Informe de contraste afirmación por afirmación",
@@ -296,6 +354,7 @@ const T: Record<string, Record<string, string>> = {
     failExplain: "Fallou a busca de evidencia ({err}). Isto non significa que non exista evidencia: volve tentalo máis tarde.",
     failNote: "AVISO: a busca de evidencia fallou por un erro técnico en {f} de {n} afirmacións comprobables; ese resultado NON indica ausencia de evidencia. Volve tentalo máis tarde.",
     failedCount: "{f} sen comprobar por fallo de busca.",
+    quotaDay: "CUOTA DIARIA DE GEMINI ESGOTADA: Google limita as peticións por proxecto e por día, e reiníciase á medianoite (hora do Pacífico). Non se gastaron máis peticións neste informe. Volve auditar despois ou consulta o panel de límites de AI Studio.",
   },
   català: {
     title: "Informe de contrast afirmació per afirmació",
@@ -311,6 +370,7 @@ const T: Record<string, Record<string, string>> = {
     failExplain: "Ha fallat la cerca d'evidència ({err}). Això no vol dir que no n'hi hagi: torna-ho a provar més tard.",
     failNote: "AVÍS: la cerca d'evidència ha fallat per un error tècnic en {f} de {n} afirmacions comprovables; aquest resultat NO indica absència d'evidència. Torna-ho a provar més tard.",
     failedCount: "{f} sense comprovar per error de cerca.",
+    quotaDay: "QUOTA DIÀRIA DE GEMINI ESGOTADA: Google limita les peticions per projecte i per dia, i es reinicia a mitjanit (hora del Pacífic). No s'han gastat més peticions en aquest informe. Torna a auditar després o consulta el panell de límits d'AI Studio.",
   },
 };
 
@@ -339,6 +399,7 @@ export function buildSummary(args: {
   if (failed > 0) result += " " + fill(t.failedCount, { f: failed });
   parts.push(result);
   if (failed > 0) parts.push(fill(t.failNote, { f: failed, n: cv.searched }));
+  if (cv.quota === "day") parts.push(t.quotaDay);
 
   const contra = args.checks.filter((c) => c.verdict === "contradicted");
   const partial = args.checks.filter((c) => c.verdict === "partially_supported");
@@ -376,16 +437,25 @@ export async function runClaimAudit(deps: AuditDeps, input: AuditInput, opts: { 
 
   const checkable = considered.filter((c) => c.claimType !== "opinion" && c.claimType !== "prediction");
 
-  // 2) evidencia, con concurrencia acotada
+  // 2) evidencia, con concurrencia acotada y un disyuntor: si la cuota DIARIA está agotada, no se gastan más peticiones
   const evidenceById = new Map<string, Evidence>();
+  let dayQuotaHit: Evidence | null = null;
+  const search = async (c: { neutralQuestion: string; claim: string }): Promise<Evidence> => {
+    if (dayQuotaHit) return { ...dayQuotaHit };
+    const ev = await searchEvidence(deps, c.neutralQuestion || c.claim);
+    if (ev.failed && ev.quota === "day") dayQuotaHit = ev;
+    return ev;
+  };
   await mapPool(checkable, opts.concurrency ?? AUDIT_CONCURRENCY, async (c) => {
-    evidenceById.set(c.id, await searchEvidence(deps, c.neutralQuestion || c.claim));
+    evidenceById.set(c.id, await search(c));
   });
-  // Segunda pasada, en serie y tras una pausa, solo para las búsquedas que fallaron por motivos técnicos (p. ej. límite de ritmo).
+  // Segunda pasada, en serie y tras una pausa (la que indique Google, hasta 45 s), solo si el fallo no es de cuota diaria.
   const failedFirst = checkable.filter((c) => evidenceById.get(c.id)?.failed);
-  if (failedFirst.length) {
-    await new Promise((r) => setTimeout(r, opts.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS));
-    for (const c of failedFirst) evidenceById.set(c.id, await searchEvidence(deps, c.neutralQuestion || c.claim));
+  if (failedFirst.length && !dayQuotaHit) {
+    const hinted = Math.max(0, ...failedFirst.map((c) => evidenceById.get(c.id)?.retryAfterSec || 0));
+    const wait = opts.retryDelayMs === 0 ? 0 : Math.max(opts.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS, Math.min(45, hinted) * 1000);
+    await new Promise((r) => setTimeout(r, wait));
+    for (const c of failedFirst) evidenceById.set(c.id, await search(c));
   }
 
   // 3) juicio (una sola llamada) solo para las afirmaciones cuya búsqueda funcionó
@@ -465,6 +535,7 @@ export async function runClaimAudit(deps: AuditDeps, input: AuditInput, opts: { 
     textTruncated,
     maxClaims: AUDIT_MAX_CLAIMS,
     searchFailed: claimChecks.filter((c) => c.searchFailed).length,
+    quota: dayQuotaHit ? ("day" as const) : undefined,
   };
 
   const hasProblem = claimChecks.some((c) => (c.verdict === "contradicted" || c.verdict === "partially_supported") && c.confidence >= 0.5);
