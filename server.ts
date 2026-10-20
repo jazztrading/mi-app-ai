@@ -12,7 +12,11 @@ import {
   securityHeaders, ID_RE, validateAnalyzeBody, dailyCostlyCap, dailyCostlyMax, isAuthRequired,
 } from "./server/security";
 import { safeFetch, parseAndValidateUrl, UnsafeUrlError } from "./server/safeFetch";
-import { runClaimAudit, rewriteWithCorrections, type AuditDeps, type ClaimCheck, type ClaimVerdict } from "./server/audit";
+import {
+  makeRegistry, resolveCitations, verifyCitation, scoreReliability, locateFragment,
+  type CitationInput, type CitationOutput, type FetchResult, type RegistryRecord, type StudyDesign, type SupportVerdict, type VerificationStatus,
+} from "./server/citations";
+import { runClaimAudit, rewriteWithCorrections, parseGeminiError, type AuditDeps, type ClaimCheck, type ClaimVerdict } from "./server/audit";
 
 // Load environment variables
 dotenv.config();
@@ -43,7 +47,13 @@ export interface VerifiedScholarlyCitation {
   journalOrVenue?: string;
   citationsCount?: number;
   openAccessUrl?: string;
-  isVerified?: boolean;
+  isVerified?: boolean; // OBSOLETO: se conserva para registros antiguos; usar verificationStatus
+  verificationStatus?: VerificationStatus; // exact | probable | related_unverified | not_found
+  supportVerdict?: SupportVerdict; // ¿el resumen de la obra respalda la afirmación?
+  supportQuote?: string; // frase literal del resumen que lo prueba
+  isRetracted?: boolean;
+  hasConcern?: boolean;
+  verificationNotes?: string[];
   link: string;
 }
 
@@ -51,7 +61,22 @@ interface CriticalPosition {
   title: string;
   argument: string;
   scientificBasis: string;
+  targetClaim?: string; // frase literal del texto analizado a la que apunta la crítica
+  targetClaimLocated?: boolean;
+  critiqueType?: string;
+  evidenceThatWouldSettleIt?: string;
+  suggestedSources?: string[]; // instituciones o bases de datos a consultar (sin enlaces inventados)
   supportingStudy?: VerifiedScholarlyCitation;
+  studyDiscardedNote?: string;
+}
+
+export interface ScoutAssessment {
+  whereAuthorIsRight: string[];
+  strongestVersion: string;
+  implicationsIfTrue: string[];
+  whatWouldChangeTheConclusion: string[];
+  evidenceSufficiency: "suficiente" | "parcial" | "insuficiente";
+  sufficiencyNote?: string;
 }
 
 interface ConstructiveDebatesSummary {
@@ -65,6 +90,7 @@ interface GlossaryTerm {
   definition: string;
   simpleExample: string;
   scientificEvidenceOrSource?: string;
+  evidenceVerification?: VerificationStatus;
   referenceUrl: string;
 }
 
@@ -76,11 +102,18 @@ export interface BibliographicSource {
   link: string;
   summary: string;
   criticalAnalysis: string;
-  reliabilityScore: number;
+  reliabilityScore?: number | null; // derivada de una rúbrica; null = no evaluable (obra no verificada)
+  reliabilityBasis?: string[];
   academicRigor: string;
   doi?: string;
   journalOrVenue?: string;
-  isVerified?: boolean;
+  isVerified?: boolean; // OBSOLETO
+  verificationStatus?: VerificationStatus;
+  supportVerdict?: SupportVerdict;
+  supportQuote?: string;
+  isRetracted?: boolean;
+  hasConcern?: boolean;
+  verificationNotes?: string[];
   citationsCount?: number;
   openAccessUrl?: string;
   isRecent?: boolean;
@@ -117,7 +150,7 @@ export interface FactCheckAudit {
   auditedFrom?: "original_text" | "summary_only";
   claimChecks?: ClaimCheck[];
   counts?: Record<ClaimVerdict, number>;
-  coverage?: { extracted: number; considered: number; searched: number; notCheckable: number; textTruncated: boolean; maxClaims: number; searchFailed?: number };
+  coverage?: { extracted: number; considered: number; searched: number; notCheckable: number; textTruncated: boolean; maxClaims: number; searchFailed?: number; quota?: "day" | "minute" };
   previousExecutiveSummary?: string;
   previousKeyPoints?: string[];
 }
@@ -144,7 +177,8 @@ export interface AnalysisResult {
   contentType: "blog" | "podcast" | "youtube" | "manual" | "photo" | "document";
   photoUrls?: string[];
   fileNames?: string[];
-  overallReliabilityScore?: number;
+  overallReliabilityScore?: number | null;
+  scoutAssessment?: ScoutAssessment;
   factCheckAudit?: FactCheckAudit;
   isEditedManually?: boolean;
 }
@@ -207,266 +241,90 @@ function saveDatabase(dbData: Record<string, AnalysisResult>) {
   }
 }
 
-// Helper to calculate lexical similarity between requested scholarly work and registry match
-function calculateTitleSimilarity(titleA: string, titleB: string): number {
-  if (!titleA || !titleB) return 0;
-  const getTokens = (str: string) => {
-    return str
-      .toLowerCase()
-      .replace(/[^a-z0-9áéíóúñ]/g, " ")
-      .split(/\s+/)
-      .filter((w) => w.length > 3 && !["with", "from", "that", "this", "sobre", "para", "como", "report", "working", "paper", "staff", "recent"].includes(w));
+// ── Verificación de citas (Fase 1): la lógica vive en server/citations.ts ────────────────────────
+// Solo se consultan hosts fijos (Crossref, OpenAlex); no hay URL controlada por el usuario, así que no pasa por safeFetch.
+const registryFetch = async (url: string): Promise<FetchResult> => {
+  try {
+    const contact = process.env.CONTACT_EMAIL;
+    const r = await fetch(url, {
+      headers: { "User-Agent": `LupaCritica/1.0${contact ? ` (mailto:${contact})` : ""}` },
+      signal: AbortSignal.timeout(6000),
+    });
+    let json: any = null;
+    try { json = await r.json(); } catch { /* sin cuerpo JSON */ }
+    return { ok: r.ok, status: r.status, json }; // no se registran URLs: pueden llevar la clave de OpenAlex
+  } catch {
+    return { ok: false, status: 0, json: null };
+  }
+};
+const newRegistry = () => makeRegistry({ fetchJson: registryFetch, mailto: process.env.CONTACT_EMAIL, openalexKey: process.env.OPENALEX_API_KEY });
+
+function sanitizeScout(raw: any): ScoutAssessment | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const list = (x: any) => (Array.isArray(x) ? x.filter((v) => typeof v === "string" && v.trim()).map((v: string) => v.trim()).slice(0, 5) : []);
+  const strongest = typeof raw.strongestVersion === "string" ? raw.strongestVersion.trim() : "";
+  const out: ScoutAssessment = {
+    whereAuthorIsRight: list(raw.whereAuthorIsRight),
+    strongestVersion: strongest,
+    implicationsIfTrue: list(raw.implicationsIfTrue),
+    whatWouldChangeTheConclusion: list(raw.whatWouldChangeTheConclusion),
+    evidenceSufficiency: ["suficiente", "parcial", "insuficiente"].includes(raw.evidenceSufficiency) ? raw.evidenceSufficiency : "parcial",
+    sufficiencyNote: typeof raw.sufficiencyNote === "string" ? raw.sufficiencyNote.trim() || undefined : undefined,
   };
-  const tokensA = getTokens(titleA);
-  const tokensB = getTokens(titleB);
-  if (tokensA.length === 0 || tokensB.length === 0) return 0.6;
-  const matchCount = tokensA.filter((t) => tokensB.includes(t)).length;
-  return matchCount / Math.max(tokensA.length, tokensB.length);
+  return out.whereAuthorIsRight.length || out.strongestVersion || out.whatWouldChangeTheConclusion.length ? out : undefined;
 }
 
-// Helper to verify a single scholarly paper through live OpenAlex & Crossref peer-review registries with modern date filtering
-async function verifySingleScholarlyWork(
-  rawTitle: string,
-  rawAuthor?: string,
-  contextKeywords?: string
-): Promise<VerifiedScholarlyCitation | null> {
-  const cleanTitle = (rawTitle || "")
-    .replace(/["“”'']/g, "")
-    .replace(/^['"]|['"]$/g, "")
-    .trim();
-  const firstAuthor = (rawAuthor || "").split(",")[0].split(" y ")[0].trim();
+const scholarSearchLink = (title: string, author?: string) =>
+  `https://scholar.google.com/scholar?q=${encodeURIComponent(`"${title}" ${author || ""}`.trim())}`;
 
-  if (!cleanTitle && !contextKeywords) return null;
-
-  // 1. Direct search in OpenAlex with clean title - prioritizing recent (2020-2026) works
-  if (cleanTitle.length > 4) {
-    try {
-      const query = firstAuthor ? `"${cleanTitle}" ${firstAuthor}` : `"${cleanTitle}"`;
-      const url = `https://api.openalex.org/works?search=${encodeURIComponent(query)}&per_page=5&mailto=academic-verifier@example.com`;
-      const res = await fetch(url, {
-        headers: { "User-Agent": "LupaCriticaAcademicBot/1.0" },
-        signal: AbortSignal.timeout(4500)
-      });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.results && data.results.length > 0) {
-          // Find candidates that are similar in title and prefer publication_year >= 2021
-          const matches = data.results.filter((m: any) => m && m.title);
-          
-          // Try to find a recent match first
-          let bestMatch = matches.find((m: any) => {
-            const sim = calculateTitleSimilarity(cleanTitle, m.title);
-            const year = m.publication_year || 0;
-            return sim >= 0.35 && year >= 2020;
-          });
-
-          // If not found, check if there is an exact or highly similar match (even if older seminal paper)
-          if (!bestMatch) {
-            bestMatch = matches.find((m: any) => {
-              const sim = calculateTitleSimilarity(cleanTitle, m.title);
-              return sim >= 0.55;
-            });
-          }
-
-          if (bestMatch) {
-            const authors = bestMatch.authorships?.slice(0, 4).map((a: any) => a.author?.display_name).filter(Boolean).join(", ") || rawAuthor || "Autores varios";
-            const firstA = authors.split(",")[0].trim();
-            return {
-              title: bestMatch.title,
-              author: authors,
-              year: String(bestMatch.publication_year || "2023"),
-              doi: bestMatch.doi ? (bestMatch.doi.startsWith("http") ? bestMatch.doi : `https://doi.org/${bestMatch.doi}`) : undefined,
-              journalOrVenue: bestMatch.primary_location?.source?.display_name || undefined,
-              citationsCount: bestMatch.cited_by_count,
-              openAccessUrl: bestMatch.open_access?.oa_url || undefined,
-              isVerified: true,
-              link: bestMatch.doi ? (bestMatch.doi.startsWith("http") ? bestMatch.doi : `https://doi.org/${bestMatch.doi}`) : `https://scholar.google.com/scholar?q=${encodeURIComponent(`"${bestMatch.title}" ${firstA}`.trim())}`
-            };
-          }
-        }
-      }
-    } catch (e) {
-      // ignore
-    }
-  }
-
-  // 2. Crossref Registry query
-  if (cleanTitle.length > 5) {
-    try {
-      const url = `https://api.crossref.org/works?query.bibliographic=${encodeURIComponent(cleanTitle + (firstAuthor ? " " + firstAuthor : ""))}&rows=3&mailto=academic-verifier@example.com`;
-      const res = await fetch(url, {
-        headers: { "User-Agent": "LupaCriticaAcademicBot/1.0" },
-        signal: AbortSignal.timeout(4500)
-      });
-      if (res.ok) {
-        const data = await res.json();
-        const items = data.message?.items || [];
-        for (const item of items) {
-          if (item && item.title?.[0]) {
-            const itemTitle = item.title[0];
-            const sim = calculateTitleSimilarity(cleanTitle, itemTitle);
-            const pubYear = item.published?.["date-parts"]?.[0]?.[0] || 2023;
-            
-            // Only accept if title is sufficiently similar and not an ancient random mismatch
-            if (sim >= 0.35 || (pubYear >= 2020 && sim >= 0.25)) {
-              const authors = item.author?.map((a: any) => `${a.given || ""} ${a.family || ""}`.trim()).filter(Boolean).join(", ") || rawAuthor || "Autores varios";
-              const itemAuthorFirst = (authors || "").split(",")[0].split(" y ")[0].trim();
-              const doiUrl = item.DOI ? (item.DOI.startsWith("http") ? item.DOI : `https://doi.org/${item.DOI}`) : undefined;
-              return {
-                title: itemTitle,
-                author: authors,
-                year: String(pubYear),
-                doi: doiUrl,
-                journalOrVenue: item["container-title"]?.[0] || undefined,
-                citationsCount: item["is-referenced-by-count"],
-                isVerified: true,
-                link: doiUrl || `https://scholar.google.com/scholar?q=${encodeURIComponent(`"${itemTitle}" ${itemAuthorFirst}`.trim())}`
-              };
-            }
-          }
-        }
-      }
-    } catch (e) {
-      // ignore
-    }
-  }
-
-  // 3. Fallback: Search OpenAlex for recent (2021-2026) peer-reviewed works matching topic keywords
-  const cleanKeywords = (contextKeywords || "").replace(/[^a-zA-Z0-9áéíóúÁÉÍÓÚñÑ\s]/g, " ").trim();
-  const searchFallback = `${firstAuthor ? firstAuthor + " " : ""}${cleanKeywords}`.trim().slice(0, 120);
-  if (searchFallback.length > 3) {
-    try {
-      const url = `https://api.openalex.org/works?search=${encodeURIComponent(searchFallback)}&filter=from_publication_date:2020-01-01&sort=publication_year:desc,cited_by_count:desc&per_page=3&mailto=academic-verifier@example.com`;
-      const res = await fetch(url, {
-        headers: { "User-Agent": "LupaCriticaAcademicBot/1.0" },
-        signal: AbortSignal.timeout(4500)
-      });
-      if (res.ok) {
-        const data = await res.json();
-        const top = data.results?.[0];
-        if (top && top.title) {
-          const authorNames = top.authorships?.slice(0, 4).map((a: any) => a.author?.display_name).filter(Boolean).join(", ") || "Autores varios";
-          const firstA = authorNames.split(",")[0].trim();
-          const doiUrl = top.doi ? (top.doi.startsWith("http") ? top.doi : `https://doi.org/${top.doi}`) : undefined;
-          return {
-            title: top.title,
-            author: authorNames,
-            year: String(top.publication_year || "2024"),
-            doi: doiUrl,
-            journalOrVenue: top.primary_location?.source?.display_name || undefined,
-            citationsCount: top.cited_by_count,
-            openAccessUrl: top.open_access?.oa_url || undefined,
-            isVerified: true,
-            link: doiUrl || `https://scholar.google.com/scholar?q=${encodeURIComponent(`"${top.title}" ${firstA}`.trim())}&as_ylo=2021`
-          };
-        }
-      }
-    } catch (e) {
-      // ignore
-    }
-  }
-
-  return null;
+function toCitationView(rec: RegistryRecord, out: Pick<CitationOutput, "status" | "support" | "supportQuote" | "notes">): VerifiedScholarlyCitation {
+  const doiUrl = rec.doi ? `https://doi.org/${rec.doi}` : undefined;
+  return {
+    title: rec.title,
+    author: rec.authors.slice(0, 4).join(", ") + (rec.authors.length > 4 ? " et al." : "") || "Autoría no indicada en el registro",
+    year: rec.year ? String(rec.year) : undefined,
+    doi: doiUrl,
+    journalOrVenue: rec.venue,
+    citationsCount: rec.citedBy,
+    openAccessUrl: rec.openAccessUrl,
+    isVerified: out.status === "exact",
+    verificationStatus: out.status,
+    supportVerdict: out.support,
+    supportQuote: out.supportQuote,
+    isRetracted: rec.isRetracted || undefined,
+    hasConcern: rec.hasConcern || undefined,
+    verificationNotes: out.notes.length ? out.notes : undefined,
+    link: doiUrl || scholarSearchLink(rec.title, rec.authors[0]),
+  };
 }
 
-// Helper to verify and enrich academic bibliographic sources via open scholarly registries (OpenAlex & Crossref)
-// with strict priority on updated publications (2021-2026)
-async function verifyAndEnrichBibliographicSources(
-  rawSources: any[],
-  contextTopic: string
-): Promise<BibliographicSource[]> {
-  if (!Array.isArray(rawSources) || rawSources.length === 0) return [];
-
-  const verifiedList: BibliographicSource[] = [];
-
-  for (const src of rawSources) {
-    const verified = await verifySingleScholarlyWork(src.title || "", src.author || "", `${contextTopic} ${src.summary || ""}`);
-
-    if (verified) {
-      const yearNum = parseInt(verified.year || src.year || "2023", 10);
-      const isRecent = !isNaN(yearNum) ? yearNum >= 2021 : true;
-      const displayYear = verified.year || src.year || "2023";
-
-      verifiedList.push({
-        title: verified.title,
-        author: verified.author,
-        year: displayYear,
-        doi: verified.doi,
-        journalOrVenue: verified.journalOrVenue,
-        citationsCount: verified.citationsCount,
-        openAccessUrl: verified.openAccessUrl,
-        isVerified: true,
-        isRecent: isRecent,
-        currencyReason: src.currencyReason || (isRecent ? "Publicación reciente con datos empíricos contemporáneos e indicadores vigentes (2021-2026)." : "Referencia fundacional clásica o estudio seminal de marco teórico histórico."),
-        currencyTag: isRecent ? `⚡ Datos Actualizados (${displayYear})` : `🏛️ Referencia Histórica Seminal (${displayYear})`,
-        type: src.type || "Paper Científico / Revisión por Pares",
-        summary: src.summary || `Investigación académica indexada sobre la materia.`,
-        criticalAnalysis: src.criticalAnalysis || `Estudio relevante para contrastar empíricamente la solidez metodológica del recurso analizado con datos actuales.`,
-        reliabilityScore: typeof src.reliabilityScore === "number" ? Math.max(88, src.reliabilityScore) : 94,
-        academicRigor: verified.journalOrVenue
-          ? `Indexado y contrastado con revisión por pares en ${verified.journalOrVenue}${verified.citationsCount ? ` (${verified.citationsCount} citas registradas)` : ""}.`
-          : `Publicación indexada en repositorio académico internacional verificado.`,
-        link: verified.link
-      });
-    } else {
-      const cleanAuthor = (src.author || "").split(",")[0].split(" y ")[0].trim();
-      const rawYear = src.year || "2024";
-      const yearNum = parseInt(rawYear, 10);
-      const isRecent = !isNaN(yearNum) ? yearNum >= 2021 : true;
-
-      verifiedList.push({
-        ...src,
-        year: rawYear,
-        isVerified: false,
-        isRecent: isRecent,
-        currencyReason: src.currencyReason || (isRecent ? "Publicación de los últimos 5 años (2021-2026) para contraste contemporáneo." : "Hito histórico o referencia seminal indispensable."),
-        currencyTag: isRecent ? `⚡ Datos Actualizados (${rawYear})` : `🏛️ Referencia Histórica Seminal (${rawYear})`,
-        link: `https://scholar.google.com/scholar?q=${encodeURIComponent(`"${src.title}" ${cleanAuthor}`.trim())}${isRecent ? '&as_ylo=2021' : ''}`
-      });
-    }
-  }
-
-  return verifiedList;
-}
-
-// Helper to verify and enrich scientific evidence citations in the Glossary
+// Evidencia del glosario: solo se enlaza una obra si existe Y coincide con la cita escrita. Nunca se sustituye por "algún paper del tema".
 async function verifyGlossaryEvidence(
   rawEvidence: string | undefined,
   termName: string,
-  generalContext: string
-): Promise<{ evidenceText: string; verifiedUrl?: string }> {
-  if (!rawEvidence || rawEvidence.trim().length < 5) {
-    // If empty or vague, search for an authoritative scholarly paper on this concept
-    const verified = await verifySingleScholarlyWork("", "", `${termName} ${generalContext}`);
-    if (verified) {
-      const formatted = `${verified.author} (${verified.year}). '${verified.title}'. ${verified.journalOrVenue ? verified.journalOrVenue + '.' : 'Publicación indexada.'}`;
+  _generalContext: string
+): Promise<{ evidenceText: string; verifiedUrl?: string; status?: VerificationStatus }> {
+  const text = (rawEvidence || "").trim();
+  if (text.length < 5) return { evidenceText: "" };
+
+  const titleMatch = text.match(/['"“](.*?)['"”]/);
+  const rawTitle = titleMatch ? titleMatch[1] : "";
+  const authorMatch = text.match(/^([A-Za-z\s,.\-&]+)\s*\(\d{4}\)/);
+  const yearMatch = text.match(/\((\d{4})\)/);
+  const link = scholarSearchLink(rawTitle || `${termName} ${text}`.slice(0, 100), authorMatch?.[1]?.trim());
+
+  if (rawTitle) {
+    const v = await verifyCitation(newRegistry(), { title: rawTitle, author: authorMatch?.[1]?.trim(), year: yearMatch?.[1] });
+    if ((v.status === "exact" || v.status === "probable") && v.record) {
+      const r = v.record;
       return {
-        evidenceText: formatted,
-        verifiedUrl: verified.link
+        evidenceText: `${r.authors.slice(0, 3).join(", ")} (${r.year ?? "s. f."}). '${r.title}'.${r.venue ? " " + r.venue + "." : ""}`,
+        verifiedUrl: r.doi ? `https://doi.org/${r.doi}` : link,
+        status: v.status,
       };
     }
-    return { evidenceText: "" };
   }
-
-  // Extract possible author or title from string (e.g. "Bollen, N. P., & Whaley, R. E. (2004)...")
-  const titleMatch = rawEvidence.match(/['"“](.*?)['"”]/);
-  const rawTitle = titleMatch ? titleMatch[1] : "";
-  const rawAuthorMatch = rawEvidence.match(/^([A-Za-z\s,.\-&]+)\s*\(\d{4}\)/);
-  const rawAuthor = rawAuthorMatch ? rawAuthorMatch[1].trim() : "";
-
-  const verified = await verifySingleScholarlyWork(rawTitle, rawAuthor, `${termName} ${rawEvidence} ${generalContext}`);
-  if (verified) {
-    const formatted = `${verified.author} (${verified.year}). '${verified.title}'. ${verified.journalOrVenue ? verified.journalOrVenue + '.' : 'Publicación indexada en repositorio académico.'}${verified.doi ? ' DOI: ' + verified.doi : ''}`;
-    return {
-      evidenceText: formatted,
-      verifiedUrl: verified.link
-    };
-  }
-
-  return {
-    evidenceText: rawEvidence,
-    verifiedUrl: `https://scholar.google.com/scholar?q=${encodeURIComponent(`${termName} ${rawEvidence}`.slice(0, 100))}`
-  };
+  return { evidenceText: text, verifiedUrl: link, status: "not_found" };
 }
 
 // Cache database loaded from disk
@@ -645,6 +503,8 @@ async function generateGroundedSearchText(
         lastErr = err;
         const errMsg = err?.message || String(err);
         console.warn(`[Gemini Grounded Search Warning] ${model} attempt ${attempt} failed:`, errMsg);
+        // En modo estricto, una cuota DIARIA agotada no mejora esperando: se pasa al siguiente modelo (cada uno tiene su propia cuota).
+        if (opts?.strict && parseGeminiError(err).quota === "day") break;
         const isTransient = errMsg.includes("429") || errMsg.includes("RESOURCE_EXHAUSTED") || errMsg.includes("503") || errMsg.includes("UNAVAILABLE");
         if (isTransient && attempt === 1) {
           await new Promise((r) => setTimeout(r, 2000 + Math.random() * 1000));
@@ -657,8 +517,8 @@ async function generateGroundedSearchText(
 
   // En modo estricto no se sustituye la búsqueda por texto generado de memoria: se avisa del fallo.
   if (opts?.strict) {
-    const reason = String(lastErr?.message || "respuesta vacía del buscador").slice(0, 300);
-    console.warn(`[Gemini Grounded Search] Falló en todos los modelos: ${reason}`);
+    const reason = String(lastErr?.message || "respuesta vacía del buscador").slice(0, 4000); // sin recortar el JSON: lleva la cuota afectada
+    console.warn(`[Gemini Grounded Search] Falló en todos los modelos: ${reason.slice(0, 300)}`);
     return { text: "", sources: [], failed: true, error: reason };
   }
 
@@ -1058,12 +918,9 @@ ${isGalego ? `
 - IDIOMA VEHICULAR: Español (castellano) universitario, formal y riguroso.
 `}
 
-*** VERIFICACIÓN FÁCTICA RIGUROSA, EXHAUSTIVIDAD HISTÓRICA Y ELECTORAL (PRECISIÓN ABSOLUTA) ***
-- Si el contenido trata sobre elecciones, escaños, partidos políticos (como BNG, etc.), comicios legislativos, cifras oficiales, fechas o eventos históricos:
-  * Comprueba exhaustivamente la serie histórica completa antes de aseverar cuál fue el "mejor resultado" o atribuir cifras.
-  * (EJEMPLO HISTÓRICO VERIFICADO INDISCUTIBLE: En las elecciones legislativas generales al Congreso de los Diputados de España, el mejor resultado histórico del Bloque Nacionalista Galego (BNG) se alcanzó en las elecciones del año 2000 con 3 ESCAÑOS y 306.268 votos [1,32%], resultando electos Francisco Rodríguez (A Coruña), Guillerme Vázquez (Pontevedra) y Carlos Aymerich (A Coruña); superando a las de 1996 [2 escaños, 270.408 votos], 2004 [2 escaños], 2008 [2 escaños], 2011 [2 escaños], 2015/2016 [0 escaños], 2019 [1 escaño] y 2023 [1 escaño]. Decir erróneamente que 1996 fue el mejor resultado con 2 escaños es una falsedad factual histórica que queda terminantemente prohibida).
-  * Si el usuario pregunta por candidatos o personas que se presentaron o resultaron electas, menciónalos con nombres completos y circunscripciones oficiales contrastadas.
-  * No hagas aseveraciones sin contrastar la serie temporal íntegra.
+*** RIGOR FÁCTICO ***
+- No afirmes cifras, fechas, cargos, resultados ni hechos históricos de los que no estés seguro. Si no lo estás, dilo y formula la duda como algo a comprobar.
+- Cuando atribuyas cifras o resultados a una fuente, no completes la serie de memoria: limítate a lo que consta en el texto o a lo que conozcas con certeza.
 
 Instrucciones detalladas de análisis:
 1. **Vídeos de YouTube, Podcasts y Multimedia**:
@@ -1091,40 +948,51 @@ Instrucciones detalladas de análisis:
 6. **Puntos Clave y Argumentos Fundamentales**:
    - Extrae entre 5 y 8 puntos clave esenciales que vertebren la argumentación lógica o el informe del texto/periódico.
 
-7. **Resúmenes Explicativos con Ejemplos Numéricos basados en Costes y Cifras Reales (OBLIGATORIO)**:
-   - Traduce los conceptos abstractos o técnicos complejos a **ejemplos numéricos claros, didácticos y tangibles basados en costes reales, cifras financieras ($M/$K), proporciones, plazos temporales y cálculos sencillos**.
-   - Proporciona entre 3 y 6 ejemplos explicativos.
-   - Ejemplo: Para 'Asimetría de Costes de Intercepción': "Un misil interceptor Patriot PAC-3 o THAAD cuesta entre $3.000.000 y $12.000.000 por unidad. Un dron de ataque unidireccional cuesta entre $20.000 y $50.000. Para neutralizar una oleada de 50 drones ($1M en total), se requieren hasta $150M a $600M en misiles de defensa, evidenciando un desequilibrio económico de 150x a 600x."
+7. **Ejemplos numéricos explicativos (solo si el texto aporta cifras o magnitudes)**:
+   - Si el texto maneja cifras, costes, proporciones o plazos, traduce los conceptos técnicos a ejemplos numéricos claros y tangibles usando EXCLUSIVAMENTE datos presentes en el texto o cifras que conozcas con certeza (indica de dónde proceden). No inventes cifras para completar.
+   - Si el texto no contiene cifras o no hay datos fiables, devuelve una lista vacía.
 
-8. **Resumen de Debates Actuales y Consensos Científicos/Académicos (OBLIGATORIO)**:
+8. **Resumen de Debates Actuales y Consensos Científicos/Académicos**:
    - Elabora un análisis exhaustivo y didáctico del estado actual del debate intelectual, científico o técnico.
    - Debes delimitar con total claridad:
      a) **overview**: Visión general del estado actual de la discusión.
      b) **keyQuestions**: Entre 3 y 5 preguntas o dilemas abiertos sobre los que aún se investiga o debate.
      c) **consensusAndDisagreements**: Detalla explícitamente consensos y puntos de desacuerdo.
 
-9. **Posiciones Críticas Causal y Científicamente Fundamentadas (Contraargumentación Rigurosa)**:
-   - Formula entre 3 y 5 **posiciones críticas rigurosas e independientes** respaldadas en evidencia empírica, metodología o análisis epistemológico.
-   - Para cada posición crítica, especifica un estudio empírico o paper académico real en 'empiricalStudy' (con título y autor verídicos) que sirva de evidencia contrastada para dicha objeción.
+9. **Posiciones críticas (contraargumentación rigurosa y constructiva)**:
+   - Formula de 0 a 5 posiciones críticas, solo las que el texto justifique. Si el texto es sólido o no hay base para criticar, devuelve menos posiciones o ninguna. No rellenes.
+   - Cada posición debe apuntar a una afirmación CONCRETA del texto: copia en 'targetClaim' una frase LITERAL (máx. 25 palabras) del texto analizado. Si no puedes copiarla literalmente, no formules esa posición.
+   - Antes de criticar, adopta la actitud de explorador: ¿qué acierta el autor?, ¿cuál es la versión más fuerte de su tesis? Critica esa versión fuerte, no una caricatura.
+   - Indica en 'critiqueType' el tipo de crítica: definicion_perimetro (qué mide realmente una cifra, qué incluye y qué excluye, cómo se financia cada partida), medicion, causal, institucional_contable, empirica, logica o normativa.
+   - Revisa siempre la validez conceptual de las cifras: perímetro y definición de la magnitud (qué agrega; si suma partidas de distinta naturaleza o de distinta fuente de financiación y si la conclusión depende de ello), numerador y denominador, valores nominales o reales, agregado o per cápita, fechas elegidas, y comparabilidad entre fuentes con definiciones distintas.
+   - No afirmes como hecho algo institucional, contable o legal de lo que no estés seguro: formúlalo como pregunta o hipótesis a comprobar. En 'evidenceThatWouldSettleIt' indica qué dato o documento lo resolvería, y en 'suggestedSources' los nombres de las instituciones o bases de datos que lo publican (solo nombres, nunca enlaces inventados).
+   - 'empiricalStudy' es OPCIONAL: inclúyelo solo si recuerdas con certeza un estudio real que trate específicamente ese argumento (título, autor y año exactos; DOI si lo conoces). Si no, OMÍTELO. Un estudio del mismo campo pero sobre otro asunto NO sirve. Se comprobará en registros académicos y se descartará si no existe o no trata el argumento.
+   - Si la evidencia disponible no basta para sostener la crítica, dilo en 'scientificBasis' (evidencia insuficiente) en vez de forzar una justificación.
 
 10. **Debates Académicos e Intelectuales Vigentes**:
    - Sitúa la tesis del artículo dentro del contexto histórico, escuelas de pensamiento rivales e implicaciones socioeconómicas o geopolíticas contemporáneas.
 
-11. **Gabinete de Fuentes Bibliográficas de Contraste (OBLIGATORIAMENTE ACTUALIZADAS 2021-2026)**:
-   - Añade entre 4 y 5 fuentes bibliográficas 100% REALES, RELEVANTES Y COMPROBABLES.
-   - **REGLA DE MÁXIMA ACTUALIZACIÓN Y VIGENCIA TEMPORAL (2021-2026)**: El usuario exige expresamente que todas las fuentes ofrecidas para contrastar la tesis sean **lo más actualizadas y recientes posibles (publicadas preferentemente entre 2022 y 2026, con un límite mínimo de 2021)**. Esto garantiza que el contraste empírico y metodológico se fundamente en datos económicos, científicos y técnicos vigentes.
-   - **PROHIBICIÓN DE CITAS OBSOLETAS**: Queda terminantemente prohibido incluir artículos o informes antiguos o desactualizados (p. ej. informes o artículos de los años 90 o 2000 como '1996') cuando existen publicaciones, informes y estudios modernos disponibles sobre la materia.
-   - **EXCEPCIÓN ESTRICTA Y JUSTIFICADA**: Únicamente si no existe literatura contemporánea o si se trata de un paper fundacional histórico indiscutible e irreemplazable (e.g. Kahneman & Tversky 1979, Taylor 1993), se admitirá un recurso previo a 2020. En tal caso excepcional, debes justificarlo explícitamente en 'currencyReason' y 'academicRigor' explicando su valor seminal.
-   - **ANTI-HALLUCINATION ABSOLUTE RULE**: ESTÁ TERMINANTEMENTE PROHIBIDO inventar títulos de papers, sintetizar publicaciones inexistentes o asociar a investigadores reales con artículos que jamás publicaron. Cada fuente DEBE ser un documento verídico comprobable en Google Scholar, JSTOR, Scopus, PubMed, IEEE, SSRN, NBER, ScienceDirect o Nature. Cita el título exacto en su idioma original de publicación y los autores reales.
+11. **Fuentes bibliográficas de contraste (opcional)**:
+   - Incluye de 0 a 5 fuentes, solo las que conozcas con certeza y que traten específicamente los asuntos del texto. Si no hay literatura suficiente o no la recuerdas con certeza, devuelve la lista vacía: es una respuesta válida y preferible a inventar.
+   - No inventes títulos, autores, años ni DOI. Si no recuerdas la referencia exacta, no la incluyas. Todas se comprobarán en Crossref y OpenAlex; las que no existan o no coincidan se marcarán como no verificadas.
+   - La antigüedad no es un criterio de calidad: un estudio clásico bien replicado vale más que un preprint reciente. No priorices ni excluyas por fecha.
+   - Indica en 'studyDesign' el diseño del estudio: systematic_review, rct, cohort, case_control, cross_sectional, case_series, expert_opinion, modeling_theory o unknown.
 
-12. **Glosario Didáctico con Ejemplos Elaborados, Precedentes Históricos y Evidencia Científica Rigurosa**:
-   - Genera un glosario de 4 a 8 términos técnicos, metodológicos, económicos o filosóficos complejos.
-   - **Para cada concepto debes aportar obligatoriamente**:
-     a) 'term': Nombre exacto del concepto o término técnico.
-     b) 'definition': Definición accesible, pedagógica y rigurosa (nivel universitario sin jerga innecesaria).
-     c) 'simpleExample': Un caso práctico o precedente histórico sustancial, detallado y rigurosamente verídico (PROHIBIDO usar metáforas vacías o analogías simplistas). Relata qué ocurrió en la historia cuando un organismo (e.g. Reserva Federal, gobiernos, comunidad científica) aplicó o desoyó este principio, qué consecuencias medibles y contrastadas se produjeron y cómo se verifica documentalmente.
-     d) 'scientificEvidenceOrSource': Cita bibliográfica 100% REAL Y VERIFICABLE (autor/es, año exacto, título verídico y revista/institución indexada como AER, JFE, JF, QJE, NBER, BIS, FED, Nature, Science, etc.) que fundamenta este concepto en la literatura empírica. Si no recuerdas el título exacto de un paper contemporáneo, cita el paper seminal histórico indiscutible del autor original del concepto (e.g. Taylor (1993) 'Discretion versus policy rules in practice'; Bollen & Whaley (2004) 'Does Net Buying Pressure Affect the Shape of the Implied Volatility Smile?'; Garleanu, Pedersen & Poteshman (2009) 'Demand-Based Option Pricing'; etc.).
-     e) 'referenceUrl': Enlace directo o de búsqueda académica verificado (Google Scholar, SSRN, NBER, etc.).
+12. **Glosario didáctico (solo los términos necesarios)**:
+   - Genera de 0 a 8 términos técnicos, metodológicos, económicos o filosóficos complejos que el lector necesite para entender el texto.
+   - Para cada término aporta:
+     a) 'term': nombre exacto del concepto.
+     b) 'definition': definición accesible y rigurosa (nivel universitario sin jerga innecesaria).
+     c) 'simpleExample': un caso práctico. Si conoces con certeza un precedente real y verificable, cuéntalo con sus consecuencias medibles; si no, usa un ejemplo numérico hipotético y ETIQUÉTALO como "ejemplo ilustrativo (hipotético)". Nunca presentes como histórico algo que no sepas con certeza.
+     d) 'scientificEvidenceOrSource' (OPCIONAL): cita bibliográfica solo si la conoces con certeza (autores, año exacto, título exacto y revista o institución). Si no, déjalo vacío: no inventes ni sustituyas por un trabajo parecido. Se comprobará en registros académicos.
+     e) 'referenceUrl': déjalo vacío salvo que conozcas con certeza la URL exacta; el sistema generará un enlace de búsqueda.
+
+13. **Evaluación de explorador (scout)**:
+   - 'whereAuthorIsRight': de 2 a 4 puntos donde el texto acierta o aporta valor.
+   - 'strongestVersion': la versión más sólida de la tesis del autor, en 1 a 3 frases.
+   - 'implicationsIfTrue': de 2 a 4 implicaciones si la tesis fuera cierta.
+   - 'whatWouldChangeTheConclusion': de 2 a 4 datos o evidencias concretas que cambiarían la conclusión.
+   - 'evidenceSufficiency': suficiente, parcial o insuficiente respecto a lo que el texto afirma, con una nota breve en 'sufficiencyNote'. Concluir "insuficiente" es legítimo.
 `;
 
       let userPrompt = "";
@@ -1132,7 +1000,7 @@ Instrucciones detalladas de análisis:
         userPrompt = `
 Has recibido ${imageList.length} fotografía(s) de un artículo de prensa, periódico, revista o documento impreso.
 Lee y transcribe minuciosamente el texto impreso, las cabeceras, subtítulos, pies de foto y los datos estadísticos visibles en la(s) foto(s).
-Lleva a cabo la deconstrucción crítica, traducción/transcripción íntegra al castellano, análisis epistemológico, fuentes bibliográficas de los últimos 5 años (2021-2026) y glosario pedagógico en castellano.
+Lleva a cabo la deconstrucción crítica, traducción/transcripción íntegra al castellano, análisis epistemológico, fuentes bibliográficas solo si las conoces con certeza, y glosario pedagógico en castellano.
 ${manualText ? `Notas o contexto adicional proporcionado por el usuario: "${manualText}"` : ""}
 `;
       } else {
@@ -1181,29 +1049,35 @@ ${textToAnalyze}
               },
               required: ["concept", "figureOrCost", "explanation"]
             },
-            description: "Lista de 3 a 6 resúmenes explicativos con ejemplos numéricos claros basados en costes y cifras reales."
+            description: "De 0 a 6 ejemplos numéricos basados SOLO en cifras del texto o conocidas con certeza. Lista vacía si no hay cifras fiables."
           },
           criticalPositions: {
             type: Type.ARRAY,
             items: {
               type: Type.OBJECT,
               properties: {
-                title: { type: Type.STRING, description: "Título de la postura crítica o contraargumento científico." },
-                argument: { type: Type.STRING, description: "Exposición detallada y clara del argumento crítico." },
-                scientificBasis: { type: Type.STRING, description: "Fundamento metodológico, empírico o teórico de esta crítica." },
+                title: { type: Type.STRING, description: "Título de la posición crítica." },
+                argument: { type: Type.STRING, description: "Exposición clara del argumento crítico, referida a la afirmación concreta del texto." },
+                scientificBasis: { type: Type.STRING, description: "Fundamento metodológico, empírico o teórico. Si la evidencia no basta, indícalo (evidencia insuficiente)." },
+                targetClaim: { type: Type.STRING, description: "Frase LITERAL (máx. 25 palabras) del texto analizado a la que apunta la crítica." },
+                critiqueType: { type: Type.STRING, enum: ["definicion_perimetro", "medicion", "causal", "institucional_contable", "empirica", "logica", "normativa"] },
+                evidenceThatWouldSettleIt: { type: Type.STRING, description: "Qué dato o documento resolvería la duda y quién lo publica." },
+                suggestedSources: { type: Type.ARRAY, items: { type: Type.STRING }, description: "Nombres de instituciones o bases de datos a consultar. Sin enlaces." },
                 empiricalStudy: {
                   type: Type.OBJECT,
+                  description: "OPCIONAL: solo si recuerdas con certeza un estudio real que trate específicamente este argumento.",
                   properties: {
-                    title: { type: Type.STRING, description: "Título exacto del estudio empírico o paper académico real de referencia." },
-                    author: { type: Type.STRING, description: "Autor/es principales o institución del estudio." },
-                    year: { type: Type.STRING, description: "Año de publicación (e.g. '2023')." }
+                    title: { type: Type.STRING, description: "Título exacto del estudio." },
+                    author: { type: Type.STRING, description: "Autor/es principales." },
+                    year: { type: Type.STRING, description: "Año de publicación." },
+                    doi: { type: Type.STRING, description: "DOI si lo conoces con certeza; si no, vacío." }
                   },
                   required: ["title", "author"]
                 }
               },
-              required: ["title", "argument", "scientificBasis"]
+              required: ["title", "argument", "scientificBasis", "targetClaim"]
             },
-            description: "Lista de 3 a 5 posiciones críticas científicas rigurosamente fundamentadas."
+            description: "De 0 a 5 posiciones críticas. Lista vacía si el texto no da base para criticar."
           },
           constructiveDebatesSummary: {
             type: Type.OBJECT,
@@ -1242,21 +1116,30 @@ ${textToAnalyze}
             items: {
               type: Type.OBJECT,
               properties: {
-                title: { type: Type.STRING, description: "TÍTULO EXACTO, REAL Y VERÍDICO del paper, libro o estudio en su idioma original de publicación (p. ej. inglés o español) tal como aparece en Google Scholar o PubMed." },
-                author: { type: Type.STRING, description: "Autor/es principales, investigadores o institución creadora." },
-                year: { type: Type.STRING, description: "Año de publicación exacto (DEBE ser preferentemente de los últimos 5 años: entre 2021 y 2026, p. ej. '2023')." },
-                isRecent: { type: Type.BOOLEAN, description: "True si fue publicado entre 2021 y 2026; false si es una referencia histórica seminal excepcional anterior a 2020." },
-                currencyReason: { type: Type.STRING, description: "Explicación concisa de la vigencia de los datos analizados o justificación del valor fundacional si es histórico." },
-                type: { type: Type.STRING, description: "Tipo de recurso (Paper Científico, Libro, Ensayo Académico, Metaanálisis, etc.)" },
-                link: { type: Type.STRING, description: "Enlace de búsqueda académica." },
-                summary: { type: Type.STRING, description: "Resumen de lo que plantea esta fuente de referencia." },
-                criticalAnalysis: { type: Type.STRING, description: "Análisis crítico y contraste directo con la tesis principal del texto analizado basado en evidencia reciente." },
-                reliabilityScore: { type: Type.NUMBER, description: "Calificación objetiva de credibilidad y rigor (0-100)." },
-                academicRigor: { type: Type.STRING, description: "Explicación detallada del porqué de esa puntuación (revisión por pares, rigor científico, vigencia temporal, etc.)" }
+                title: { type: Type.STRING, description: "Título EXACTO de una obra que conozcas con certeza, en su idioma original." },
+                author: { type: Type.STRING, description: "Autor/es principales o institución." },
+                year: { type: Type.STRING, description: "Año de publicación." },
+                doi: { type: Type.STRING, description: "DOI si lo conoces con certeza; si no, vacío." },
+                type: { type: Type.STRING, description: "Tipo de recurso (artículo, libro, informe, metaanálisis...)." },
+                studyDesign: { type: Type.STRING, enum: ["systematic_review", "rct", "cohort", "case_control", "cross_sectional", "case_series", "expert_opinion", "modeling_theory", "unknown"] },
+                summary: { type: Type.STRING, description: "Qué plantea esta fuente, según recuerdas." },
+                criticalAnalysis: { type: Type.STRING, description: "Cómo se relaciona con la tesis del texto. Será comprobado contra el resumen real de la obra." }
               },
-              required: ["title", "author", "year", "type", "link", "summary", "criticalAnalysis", "reliabilityScore", "academicRigor"]
+              required: ["title", "author", "year", "type", "summary", "criticalAnalysis"]
             },
-            description: "Lista de 4 a 5 fuentes bibliográficas REALES, EXISTENTES Y RIGUROSAMENTE ACTUALIZADAS (2021-2026)."
+            description: "De 0 a 5 fuentes que conozcas con certeza. Lista vacía si no hay literatura suficiente o no la recuerdas."
+          },
+          scoutAssessment: {
+            type: Type.OBJECT,
+            properties: {
+              whereAuthorIsRight: { type: Type.ARRAY, items: { type: Type.STRING } },
+              strongestVersion: { type: Type.STRING },
+              implicationsIfTrue: { type: Type.ARRAY, items: { type: Type.STRING } },
+              whatWouldChangeTheConclusion: { type: Type.ARRAY, items: { type: Type.STRING } },
+              evidenceSufficiency: { type: Type.STRING, enum: ["suficiente", "parcial", "insuficiente"] },
+              sufficiencyNote: { type: Type.STRING }
+            },
+            required: ["whereAuthorIsRight", "strongestVersion", "whatWouldChangeTheConclusion", "evidenceSufficiency"]
           }
         },
         required: ["originalTitle", "originalLanguage", "isSpanishOrGalician", "categories", "translation", "executiveSummary", "keyPoints", "numericalExamples", "criticalPositions", "constructiveDebatesSummary", "academicDebates", "glossary", "bibliographicSources"]
@@ -1288,36 +1171,107 @@ ${textToAnalyze}
 
       const contextKeywords = [result.originalTitle || title, ...(result.categories || [])].filter(Boolean).join(" ");
 
-      // 1. Verify and enrich all critical debate positions with live peer-reviewed scholarly evidence
-      const rawCritical = result.criticalPositions || [];
-      const sanitizedCriticalPositions: CriticalPosition[] = [];
+      // Fase 1: cada cita se comprueba en tres niveles (existe · coincide · respalda). Ver server/citations.ts.
+      const rawCritical: any[] = result.criticalPositions || [];
+      const rawSources: any[] = result.bibliographicSources || [];
+      const citeInputs: CitationInput[] = [
+        ...rawCritical.map((c, i): CitationInput => ({
+          id: `p${i}`,
+          claim: `${c.title || ""}. ${c.argument || ""}`.trim(),
+          cited: c.empiricalStudy?.title ? { title: c.empiricalStudy.title, author: c.empiricalStudy.author, year: c.empiricalStudy.year, doi: c.empiricalStudy.doi } : undefined,
+          relatedQuery: `${c.title || ""} ${(result.categories || []).join(" ")}`.trim().slice(0, 160),
+          dropIfUnrelated: true,
+        })),
+        ...rawSources.map((src, i): CitationInput => ({
+          id: `s${i}`,
+          claim: (src.criticalAnalysis || src.summary || src.title || "").slice(0, 600),
+          cited: { title: src.title || "", author: src.author, year: src.year, doi: src.doi },
+          dropIfUnrelated: false,
+        })),
+      ];
+      let citeOutputs: CitationOutput[] = [];
+      try {
+        citeOutputs = await resolveCitations(
+          newRegistry(),
+          (prompt, system, schema) => generateAnalysisContentWithRetry(prompt, system, schema, false),
+          citeInputs,
+          detectedLang
+        );
+      } catch (citeErr) {
+        console.error("Error verificando citas (se muestran como no verificadas):", citeErr);
+      }
+      const citeById = new Map(citeOutputs.map((o) => [o.id, o]));
 
-      for (const crit of rawCritical) {
-        const studyQuery = crit.empiricalStudy?.title || `${crit.title} ${crit.scientificBasis}`;
-        const studyAuthor = crit.empiricalStudy?.author || "";
-        const verifiedStudy = await verifySingleScholarlyWork(studyQuery, studyAuthor, `${contextKeywords} ${crit.title}`);
-
-        sanitizedCriticalPositions.push({
+      const sanitizedCriticalPositions: CriticalPosition[] = rawCritical.map((crit, i) => {
+        const o = citeById.get(`p${i}`);
+        const quote = typeof crit.targetClaim === "string" ? crit.targetClaim.trim() : "";
+        const located = !!quote && !!textToAnalyze && locateFragment(quote, textToAnalyze);
+        return {
           title: crit.title || "",
           argument: crit.argument || "",
           scientificBasis: crit.scientificBasis || "",
-          supportingStudy: verifiedStudy ? {
-            title: verifiedStudy.title,
-            author: verifiedStudy.author,
-            year: verifiedStudy.year,
-            doi: verifiedStudy.doi,
-            journalOrVenue: verifiedStudy.journalOrVenue,
-            citationsCount: verifiedStudy.citationsCount,
-            openAccessUrl: verifiedStudy.openAccessUrl,
-            isVerified: true,
-            link: verifiedStudy.link
-          } : undefined
-        });
-      }
+          targetClaim: located ? quote : undefined, // una cita "literal" que no está en el texto no se muestra
+          targetClaimLocated: quote ? located : undefined,
+          critiqueType: crit.critiqueType || undefined,
+          evidenceThatWouldSettleIt: crit.evidenceThatWouldSettleIt || undefined,
+          suggestedSources: Array.isArray(crit.suggestedSources) ? crit.suggestedSources.filter((x: any) => typeof x === "string" && x.trim()).slice(0, 4) : undefined,
+          supportingStudy: o?.record ? toCitationView(o.record, o) : undefined,
+          studyDiscardedNote: o?.discarded ? `El estudio que propuso el modelo («${o.discarded.title}») se descartó: ${o.discarded.reason}.` : undefined,
+        };
+      });
 
-      // 2. Verify and enrich all recommended bibliographic sources
-      const rawSources = result.bibliographicSources || [];
-      const sanitizedSources = await verifyAndEnrichBibliographicSources(rawSources, contextKeywords);
+      const sanitizedSources: BibliographicSource[] = rawSources.map((src, i) => {
+        const o = citeById.get(`s${i}`);
+        const design = (src.studyDesign || "unknown") as StudyDesign;
+        const yearNum = parseInt(String(o?.record?.year ?? src.year ?? ""), 10);
+        const displayYear = o?.record?.year ? String(o.record.year) : src.year || "s. f.";
+        if (o?.record && (o.status === "exact" || o.status === "probable")) {
+          const view = toCitationView(o.record, o);
+          const rel = scoreReliability(o.record, o.status, design);
+          return {
+            title: view.title,
+            author: view.author,
+            year: displayYear,
+            type: src.type || "Fuente académica",
+            link: view.link,
+            summary: src.summary || "",
+            criticalAnalysis: src.criticalAnalysis || "",
+            reliabilityScore: rel.score,
+            reliabilityBasis: rel.basis,
+            academicRigor: rel.basis.join(" · "),
+            doi: view.doi,
+            journalOrVenue: view.journalOrVenue,
+            citationsCount: view.citationsCount,
+            openAccessUrl: view.openAccessUrl,
+            isVerified: o.status === "exact",
+            verificationStatus: o.status,
+            supportVerdict: o.support,
+            supportQuote: o.supportQuote,
+            isRetracted: view.isRetracted,
+            hasConcern: view.hasConcern,
+            verificationNotes: view.verificationNotes,
+            isRecent: !isNaN(yearNum) ? yearNum >= 2021 : undefined,
+            currencyTag: `📅 ${displayYear}`, // la recencia no es calidad: etiqueta neutra
+          };
+        }
+        // No verificada: se conserva lo que dijo el modelo, sin sello ni puntuación, y con enlace de búsqueda
+        return {
+          title: src.title || "",
+          author: src.author || "",
+          year: displayYear,
+          type: src.type || "Fuente académica",
+          link: scholarSearchLink(src.title || "", String(src.author || "").split(",")[0]),
+          summary: src.summary || "",
+          criticalAnalysis: src.criticalAnalysis || "",
+          reliabilityScore: null,
+          reliabilityBasis: ["No evaluable: la obra no se localizó o no coincide con ningún registro académico."],
+          academicRigor: "No verificada: no se ha localizado en Crossref ni OpenAlex una obra que coincida con esta cita.",
+          isVerified: false,
+          verificationStatus: "not_found",
+          verificationNotes: o?.notes?.length ? o.notes : undefined,
+          currencyTag: `📅 ${displayYear}`,
+        };
+      });
 
       const rawGlossary = result.glossary || [];
       const sanitizedGlossary: GlossaryTerm[] = [];
@@ -1333,6 +1287,7 @@ ${textToAnalyze}
           definition: g.definition || "",
           simpleExample: g.simpleExample || "",
           scientificEvidenceOrSource: verifiedEv.evidenceText || g.scientificEvidenceOrSource || undefined,
+          evidenceVerification: verifiedEv.status,
           referenceUrl: cleanRef
         });
       }
@@ -1340,10 +1295,9 @@ ${textToAnalyze}
       const isDoc = documentNames.length > 0;
       const isPhoto = imageList.length > 0 && documentNames.length === 0;
 
-      // Calculate overall average reliability score
-      const overallReliabilityScore = sanitizedSources.length > 0
-        ? Math.round(sanitizedSources.reduce((acc, s) => acc + (s.reliabilityScore || 80), 0) / sanitizedSources.length)
-        : 88;
+      // Fiabilidad global: media de las fuentes VERIFICADAS con puntuación evaluable; si no hay ninguna, no se inventa un número.
+      const scored = sanitizedSources.filter((x) => typeof x.reliabilityScore === "number") as Array<BibliographicSource & { reliabilityScore: number }>;
+      const overallReliabilityScore: number | null = scored.length > 0 ? Math.round(scored.reduce((acc, x) => acc + x.reliabilityScore, 0) / scored.length) : null;
 
       // Construct the final analysis structure
       const analysisId = "analysis_" + Date.now();
@@ -1365,6 +1319,7 @@ ${textToAnalyze}
         academicDebates: result.academicDebates || "",
         glossary: sanitizedGlossary,
         bibliographicSources: sanitizedSources,
+        scoutAssessment: sanitizeScout(result.scoutAssessment),
         analyzedAt: new Date().toISOString(),
         contentType: isDoc ? "document" : (isPhoto ? "photo" : (contentType || "blog")),
         photoUrls: imageList.length > 0 ? imageList : undefined,
