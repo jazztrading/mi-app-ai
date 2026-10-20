@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { applyGuards, locateFragment, runClaimAudit as runRaw, rewriteWithCorrections, sanitizeError, type AuditDeps } from "../server/audit";
+import { applyGuards, locateFragment, runClaimAudit as runRaw, rewriteWithCorrections, sanitizeError, parseGeminiError, type AuditDeps } from "../server/audit";
 const runClaimAudit = (d: AuditDeps, i: any) => runRaw(d, i, { retryDelayMs: 0 });
 
 const ARTICLE =
@@ -199,4 +199,51 @@ test("sanitizeError extrae el mensaje JSON, oculta claves y acota la longitud", 
   assert.doesNotMatch(sanitizeError("fallo con AIzaSyA1234567890abcdefghijklmnop dentro"), /AIza/);
   assert.ok(sanitizeError("x".repeat(1000)).length <= 200);
   assert.equal(sanitizeError(undefined), "error desconocido");
+});
+
+const DAY_429 = JSON.stringify({ error: { code: 429, message: "You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-limits.", status: "RESOURCE_EXHAUSTED", details: [
+  { "@type": "type.googleapis.com/google.rpc.QuotaFailure", violations: [{ quotaMetric: "generativelanguage.googleapis.com/generate_content_free_tier_requests", quotaId: "GenerateRequestsPerDayPerProjectPerModel-FreeTier", quotaDimensions: { model: "gemini-flash-latest" }, quotaValue: "20" }] },
+  { "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay: "23s" }] } });
+const MIN_429 = DAY_429.replace("PerDayPerProjectPerModel", "PerMinutePerProjectPerModel");
+
+test("parseGeminiError distingue cuota diaria de cuota por minuto y extrae modelo y espera", () => {
+  const d = parseGeminiError(DAY_429);
+  assert.equal(d.quota, "day"); assert.equal(d.model, "gemini-flash-latest"); assert.equal(d.retryAfterSec, 23);
+  assert.equal(parseGeminiError(MIN_429).quota, "minute");
+  assert.equal(parseGeminiError("503 service unavailable").quota, undefined);
+  assert.equal(parseGeminiError("ApiError: " + DAY_429).quota, "day", "texto delante del JSON");
+  assert.equal(parseGeminiError("429 RESOURCE_EXHAUSTED sin detalle").quota, "other");
+  const msg = sanitizeError(DAY_429);
+  assert.match(msg, /GenerateRequestsPerDayPerProjectPerModel/);
+  assert.match(msg, /medianoche, hora del Pacífico/);
+  assert.match(msg, /reintentar en ~23 s/);
+  assert.doesNotMatch(msg, /https?:/, "sin enlaces largos");
+});
+
+test("disyuntor: con la cuota DIARIA agotada no se lanzan más búsquedas ni segunda pasada, y el informe lo explica", async () => {
+  let searches = 0;
+  const many = { ...claims[2] };
+  const deps: AuditDeps = {
+    llmJson: async (_p, system) => (system.includes("extrae afirmaciones") ? JSON.stringify({ claims: Array.from({ length: 8 }, (_, i) => ({ ...many, claim: "afirmación " + i, importance: 3 })) }) : JSON.stringify({ results: [] })),
+    groundedSearch: async () => { searches++; return { text: "", sources: [], failed: true, error: DAY_429 }; },
+  };
+  const out = await runClaimAudit(deps, input);
+  assert.ok(searches <= 2, `se hicieron ${searches} búsquedas (máx. = concurrencia 2)`);
+  assert.equal(out.coverage.quota, "day");
+  assert.equal(out.coverage.searchFailed, 8);
+  assert.match(out.summaryAudit, /CUOTA DIARIA DE GEMINI AGOTADA/);
+  assert.match(out.claimChecks[7].explanation, /límite diario/);
+});
+
+test("cuota por minuto: se espera y se reintenta, y la afirmación acaba evaluada", async () => {
+  const calls: number[] = [];
+  const base = makeDeps();
+  const deps: AuditDeps = { ...base, groundedSearch: async (prompt) => {
+    calls.push(1);
+    if (calls.length === 1) return { text: "", sources: [], failed: true, error: MIN_429 };
+    return base.groundedSearch(prompt);
+  } };
+  const out = await runClaimAudit({ ...deps, llmJson: async (p, s) => (s.includes("extrae afirmaciones") ? JSON.stringify({ claims: [claims[0]] }) : base.llmJson(p, s, null)) }, input);
+  assert.equal(out.coverage.quota, undefined);
+  assert.equal(out.claimChecks[0].verdict, "contradicted");
 });
