@@ -23,6 +23,8 @@ export interface RegistryRecord {
   hasConcern?: boolean;
   abstract?: string;
   openAccessUrl?: string;
+  sourceUrl?: string; // página institucional donde se localizó (cuando no hay DOI)
+  institutional?: boolean; // dominio de un organismo oficial reconocido (lista interna, no exhaustiva)
 }
 
 export interface CitationClaim {
@@ -30,7 +32,10 @@ export interface CitationClaim {
   author?: string;
   year?: string | number;
   doi?: string;
+  url?: string; // para informes institucionales sin DOI: se COMPRUEBA que la página contiene el título citado
 }
+
+export type PageFetcher = (url: string) => Promise<{ ok: boolean; html: string; finalUrl: string } | null>;
 
 export interface VerificationResult {
   status: VerificationStatus;
@@ -118,6 +123,88 @@ const stripJats = (s?: string) => (s ? s.replace(/<[^>]+>/g, " ").replace(/\s+/g
 export function locateFragment(fragment: string, text: string): boolean {
   const f = normalizeText(fragment);
   return f.length >= 12 && normalizeText(text).includes(f);
+}
+
+// ── literatura gris e informes institucionales ───────────────────────────────
+// Los informes de organismos (Comisión Europea, OCDE, FMI, bancos centrales, institutos de estadística...) suelen no estar
+// en Crossref ni OpenAlex. Se aceptan si la página indicada contiene realmente el título citado. Nunca llegan a "exact".
+const INSTITUTIONAL_SUFFIXES = [
+  "europa.eu", "oecd.org", "oecd-ilibrary.org", "imf.org", "worldbank.org", "un.org", "who.int", "ilo.org", "bis.org", "ecb.europa.eu",
+  "bde.es", "airef.es", "ine.es", "seg-social.es", "boe.es", "congreso.es", "senado.es", "bancaditalia.it", "bundesbank.de", "banque-france.fr",
+];
+const INSTITUTIONAL_PATTERNS = [/\.gob\.es$/, /\.gov$/, /\.gov\.[a-z]{2}$/, /\.gouv\.fr$/, /\.europa\.eu$/];
+
+export function isInstitutionalHost(host: string): boolean {
+  const h = host.toLowerCase().replace(/^www\./, "");
+  return INSTITUTIONAL_SUFFIXES.some((x) => h === x || h.endsWith("." + x)) || INSTITUTIONAL_PATTERNS.some((re) => re.test(h));
+}
+
+const decodeEntities = (t: string) =>
+  t.replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#0?39;|&apos;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/\s+/g, " ").trim();
+
+export function parseHtmlMeta(html: string): { titles: string[]; description?: string } {
+  const titles: string[] = [];
+  const grab = (re: RegExp) => {
+    const m = html.match(re);
+    if (m && m[1]) titles.push(decodeEntities(m[1].replace(/<[^>]+>/g, " ")));
+  };
+  grab(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  grab(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i);
+  grab(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:title["']/i);
+  grab(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+  const d =
+    html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i) ||
+    html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+name=["']description["']/i) ||
+    html.match(/<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["']/i);
+  const description = d ? decodeEntities(d[1]) : undefined;
+  return { titles: titles.filter(Boolean), description: description && description.length >= 40 ? description : undefined };
+}
+
+/** Similitud para títulos de página: además de Dice, acepta que un título contenga al otro (p. ej. "... - European Commission"). */
+function pageTitleSimilarity(claimTitle: string, pageTitle: string): number {
+  const a = normalizeText(claimTitle).replace(/^the /, "");
+  const b = normalizeText(pageTitle).replace(/^the /, "");
+  const dice = titleSimilarity(a, b);
+  const shorter = a.length <= b.length ? a : b;
+  const longer = a.length <= b.length ? b : a;
+  const contains = shorter.split(" ").length >= 4 && longer.includes(shorter);
+  return Math.max(dice, contains ? 0.95 : 0);
+}
+
+export async function verifyInstitutionalPage(claim: CitationClaim, fetchPage: PageFetcher): Promise<VerificationResult> {
+  if (!claim.url) return { status: "not_found", notes: [] };
+  let host = "";
+  try {
+    const u = new URL(claim.url);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return { status: "not_found", notes: ["La URL indicada no es http(s)."] };
+    host = u.hostname;
+  } catch {
+    return { status: "not_found", notes: ["La URL indicada no es válida."] };
+  }
+  const page = await fetchPage(claim.url);
+  if (!page || !page.ok) return { status: "not_found", notes: ["No se pudo abrir la página indicada para comprobar la cita."] };
+  const meta = parseHtmlMeta(page.html);
+  const best = meta.titles.map((t) => ({ t, sim: pageTitleSimilarity(claim.title, t) })).sort((x, y) => y.sim - x.sim)[0];
+  if (!best || best.sim < 0.9) {
+    return { status: "not_found", notes: ["La página indicada no contiene el título citado; se descarta."], titleSimilarity: best?.sim };
+  }
+  let finalHost = host;
+  try { finalHost = new URL(page.finalUrl).hostname; } catch { /* usar el original */ }
+  const record: RegistryRecord = {
+    title: best.t,
+    authors: [],
+    venue: finalHost,
+    type: "report",
+    abstract: meta.description,
+    sourceUrl: page.finalUrl,
+    institutional: isInstitutionalHost(finalHost),
+  };
+  return {
+    status: "probable", // existe y el título coincide, pero sin DOI ni registro bibliográfico: nunca "exact"
+    record,
+    titleSimilarity: best.sim,
+    notes: [`Localizada en la web de ${finalHost}: el título coincide. Sin DOI ni indexación en Crossref/OpenAlex.${record.institutional ? " Dominio institucional reconocido." : ""}`],
+  };
 }
 
 // ── decisión de estado ───────────────────────────────────────────────────────
@@ -256,7 +343,7 @@ async function enrich(reg: Registry, rec: RegistryRecord): Promise<RegistryRecor
   return mergeRecords(rec, reg.openalexEnabled() ? await reg.openalexByDoi(rec.doi) : null);
 }
 
-export async function verifyCitation(reg: Registry, claim: CitationClaim): Promise<VerificationResult> {
+export async function verifyCitation(reg: Registry, claim: CitationClaim, fetchPage?: PageFetcher): Promise<VerificationResult> {
   const notes: string[] = [];
   if (!claim.title || normalizeText(claim.title).length < 5) return { status: "not_found", notes: ["La cita no incluye un título utilizable."] };
   const doi = cleanDoi(claim.doi);
@@ -301,6 +388,13 @@ export async function verifyCitation(reg: Registry, claim: CitationClaim): Promi
     notes.push(`Ninguna obra del registro coincide con el título citado (la más parecida tiene similitud ${best.sim.toFixed(2)}).`);
   } else {
     notes.push("El registro no devolvió resultados para esta cita.");
+  }
+
+  // 3) literatura gris: si hay URL, se comprueba que la página contiene el título citado
+  if (claim.url && fetchPage) {
+    const page = await verifyInstitutionalPage(claim, fetchPage);
+    if (page.status === "probable") return { ...page, notes: [...notes, ...page.notes] };
+    notes.push(...page.notes);
   }
   return { status: "not_found", notes };
 }
@@ -394,6 +488,7 @@ export function scoreReliability(rec: RegistryRecord | undefined, status: Verifi
   let venuePts = 10;
   let venueTxt = "tipo de publicación no determinado (+10)";
   if (/journal-article|^article$/.test(t) && rec.venue) { venuePts = 30; venueTxt = `artículo de revista (${rec.venue}) (+30)`; }
+  else if (/report/.test(t) && rec.institutional) { venuePts = 25; venueTxt = "informe de un organismo oficial (dominio institucional reconocido) (+25)"; }
   else if (/book|monograph|report|chapter|proceedings/.test(t)) { venuePts = 20; venueTxt = "libro, informe o actas (+20)"; }
   else if (/preprint|posted-content/.test(t)) { venuePts = 10; venueTxt = "preprint, sin revisión por pares confirmada (+10)"; }
   score += venuePts;
@@ -428,14 +523,14 @@ export interface CitationOutput {
   discarded?: { title: string; reason: string };
 }
 
-export async function resolveCitations(reg: Registry, llmJson: LlmJson, inputs: CitationInput[], lang = "castellano"): Promise<CitationOutput[]> {
+export async function resolveCitations(reg: Registry, llmJson: LlmJson, inputs: CitationInput[], lang = "castellano", opts: { fetchPage?: PageFetcher } = {}): Promise<CitationOutput[]> {
   // A) existe y coincide
   const verif = new Map<string, VerificationResult>();
   let next = 0;
   const worker = async () => {
     while (next < inputs.length) {
       const inp = inputs[next++];
-      verif.set(inp.id, inp.cited?.title ? await verifyCitation(reg, inp.cited) : { status: "not_found", notes: [] });
+      verif.set(inp.id, inp.cited?.title ? await verifyCitation(reg, inp.cited, opts.fetchPage) : { status: "not_found", notes: [] });
     }
   };
   await Promise.all(Array.from({ length: Math.min(3, inputs.length) }, worker)); // 3 a la vez: educado con Crossref/OpenAlex
