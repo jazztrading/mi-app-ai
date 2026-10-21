@@ -14,7 +14,7 @@ import {
 import { safeFetch, parseAndValidateUrl, UnsafeUrlError } from "./server/safeFetch";
 import {
   makeRegistry, resolveCitations, verifyCitation, scoreReliability, locateFragment,
-  type CitationInput, type CitationOutput, type FetchResult, type RegistryRecord, type StudyDesign, type SupportVerdict, type VerificationStatus,
+  type CitationInput, type CitationOutput, type FetchResult, type PageFetcher, type RegistryRecord, type StudyDesign, type SupportVerdict, type VerificationStatus,
 } from "./server/citations";
 import { runClaimAudit, rewriteWithCorrections, parseGeminiError, type AuditDeps, type ClaimCheck, type ClaimVerdict } from "./server/audit";
 
@@ -257,6 +257,20 @@ const registryFetch = async (url: string): Promise<FetchResult> => {
     return { ok: false, status: 0, json: null };
   }
 };
+// Para informes institucionales sin DOI: abre la URL que propone el modelo (con el anti-SSRF de safeFetch) y devuelve el HTML.
+const pageFetcher: PageFetcher = async (url) => {
+  try {
+    const r = await safeFetch(url, {
+      timeoutMs: 8000,
+      maxBytes: 1_500_000,
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; LupaCritica/1.0)", "Accept": "text/html,application/xhtml+xml" },
+    });
+    if (!r.ok || /pdf|octet-stream/i.test(r.contentType)) return null;
+    return { ok: true, html: await r.text(), finalUrl: r.finalUrl };
+  } catch {
+    return null; // incluye URL no segura o inaccesible
+  }
+};
 const newRegistry = () => makeRegistry({ fetchJson: registryFetch, mailto: process.env.CONTACT_EMAIL, openalexKey: process.env.OPENALEX_API_KEY });
 
 function sanitizeScout(raw: any): ScoutAssessment | undefined {
@@ -294,7 +308,7 @@ function toCitationView(rec: RegistryRecord, out: Pick<CitationOutput, "status" 
     isRetracted: rec.isRetracted || undefined,
     hasConcern: rec.hasConcern || undefined,
     verificationNotes: out.notes.length ? out.notes : undefined,
-    link: doiUrl || scholarSearchLink(rec.title, rec.authors[0]),
+    link: doiUrl || rec.sourceUrl || scholarSearchLink(rec.title, rec.authors[0]),
   };
 }
 
@@ -975,6 +989,7 @@ Instrucciones detalladas de análisis:
 11. **Fuentes bibliográficas de contraste (opcional)**:
    - Incluye de 0 a 5 fuentes, solo las que conozcas con certeza y que traten específicamente los asuntos del texto. Si no hay literatura suficiente o no la recuerdas con certeza, devuelve la lista vacía: es una respuesta válida y preferible a inventar.
    - No inventes títulos, autores, años ni DOI. Si no recuerdas la referencia exacta, no la incluyas. Todas se comprobarán en Crossref y OpenAlex; las que no existan o no coincidan se marcarán como no verificadas.
+   - Para informes de organismos oficiales sin DOI (Comisión Europea, OCDE, FMI, bancos centrales, institutos de estadística...) indica en 'url' la dirección exacta SOLO si la conoces con certeza: se comprobará que la página contiene el título citado y se descartará si no.
    - La antigüedad no es un criterio de calidad: un estudio clásico bien replicado vale más que un preprint reciente. No priorices ni excluyas por fecha.
    - Indica en 'studyDesign' el diseño del estudio: systematic_review, rct, cohort, case_control, cross_sectional, case_series, expert_opinion, modeling_theory o unknown.
 
@@ -1070,7 +1085,8 @@ ${textToAnalyze}
                     title: { type: Type.STRING, description: "Título exacto del estudio." },
                     author: { type: Type.STRING, description: "Autor/es principales." },
                     year: { type: Type.STRING, description: "Año de publicación." },
-                    doi: { type: Type.STRING, description: "DOI si lo conoces con certeza; si no, vacío." }
+                    doi: { type: Type.STRING, description: "DOI si lo conoces con certeza; si no, vacío." },
+                    url: { type: Type.STRING, description: "URL exacta de un informe institucional, solo si la conoces con certeza; si no, vacío." }
                   },
                   required: ["title", "author"]
                 }
@@ -1120,6 +1136,7 @@ ${textToAnalyze}
                 author: { type: Type.STRING, description: "Autor/es principales o institución." },
                 year: { type: Type.STRING, description: "Año de publicación." },
                 doi: { type: Type.STRING, description: "DOI si lo conoces con certeza; si no, vacío." },
+                url: { type: Type.STRING, description: "Para informes de organismos oficiales sin DOI: URL exacta solo si la conoces con certeza; si no, vacío." },
                 type: { type: Type.STRING, description: "Tipo de recurso (artículo, libro, informe, metaanálisis...)." },
                 studyDesign: { type: Type.STRING, enum: ["systematic_review", "rct", "cohort", "case_control", "cross_sectional", "case_series", "expert_opinion", "modeling_theory", "unknown"] },
                 summary: { type: Type.STRING, description: "Qué plantea esta fuente, según recuerdas." },
@@ -1178,14 +1195,14 @@ ${textToAnalyze}
         ...rawCritical.map((c, i): CitationInput => ({
           id: `p${i}`,
           claim: `${c.title || ""}. ${c.argument || ""}`.trim(),
-          cited: c.empiricalStudy?.title ? { title: c.empiricalStudy.title, author: c.empiricalStudy.author, year: c.empiricalStudy.year, doi: c.empiricalStudy.doi } : undefined,
+          cited: c.empiricalStudy?.title ? { title: c.empiricalStudy.title, author: c.empiricalStudy.author, year: c.empiricalStudy.year, doi: c.empiricalStudy.doi, url: c.empiricalStudy.url } : undefined,
           relatedQuery: `${c.title || ""} ${(result.categories || []).join(" ")}`.trim().slice(0, 160),
           dropIfUnrelated: true,
         })),
         ...rawSources.map((src, i): CitationInput => ({
           id: `s${i}`,
           claim: (src.criticalAnalysis || src.summary || src.title || "").slice(0, 600),
-          cited: { title: src.title || "", author: src.author, year: src.year, doi: src.doi },
+          cited: { title: src.title || "", author: src.author, year: src.year, doi: src.doi, url: src.url },
           dropIfUnrelated: false,
         })),
       ];
@@ -1195,7 +1212,8 @@ ${textToAnalyze}
           newRegistry(),
           (prompt, system, schema) => generateAnalysisContentWithRetry(prompt, system, schema, false),
           citeInputs,
-          detectedLang
+          detectedLang,
+          { fetchPage: pageFetcher }
         );
       } catch (citeErr) {
         console.error("Error verificando citas (se muestran como no verificadas):", citeErr);
@@ -1230,7 +1248,7 @@ ${textToAnalyze}
           const rel = scoreReliability(o.record, o.status, design);
           return {
             title: view.title,
-            author: view.author,
+            author: o.record.authors.length ? view.author : `${src.author || "—"} (según el modelo)`,
             year: displayYear,
             type: src.type || "Fuente académica",
             link: view.link,
@@ -1265,7 +1283,7 @@ ${textToAnalyze}
           criticalAnalysis: src.criticalAnalysis || "",
           reliabilityScore: null,
           reliabilityBasis: ["No evaluable: la obra no se localizó o no coincide con ningún registro académico."],
-          academicRigor: "No verificada: no se ha localizado en Crossref ni OpenAlex una obra que coincida con esta cita.",
+          academicRigor: "No verificada: no se ha localizado una obra que coincida con esta cita en Crossref, OpenAlex ni en la página indicada. Los informes de organismos y la literatura gris suelen no estar indexados; esto no significa que no exista, sino que la app no ha podido comprobarlo.",
           isVerified: false,
           verificationStatus: "not_found",
           verificationNotes: o?.notes?.length ? o.notes : undefined,
