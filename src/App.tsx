@@ -2623,13 +2623,12 @@ export default function App() {
                             <BookOpen className="w-5 h-5 text-indigo-600" />
                             Gabinete de Fuentes Bibliográficas de Contraste
                           </h3>
-                          <span className="text-[10px] font-mono font-bold text-emerald-800 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full flex items-center gap-1">
-                            <Sparkles className="w-3 h-3 text-emerald-600" />
-                            Datos Actualizados (2021-2026)
+                          <span className="text-[10px] font-mono font-bold text-slate-700 bg-slate-100 border border-slate-200 px-2 py-0.5 rounded-full">
+                            {selectedAnalysis.bibliographicSources.filter((x) => x.verificationStatus === "exact" || x.verificationStatus === "probable").length} de {selectedAnalysis.bibliographicSources.length} verificadas
                           </span>
                         </div>
                         <p className="text-xs text-slate-500 mt-1">
-                          Fuentes y publicaciones indexadas con máxima prioridad en los últimos 5 años (2021-2026) para contrastar la tesis central con indicadores, literatura y datos empíricos contemporáneos.
+                          Fuentes propuestas para contrastar la tesis central, con su estado de verificación. La antigüedad no se usa como criterio de calidad: un clásico bien replicado puede valer más que un preprint reciente.
                         </p>
                       </div>
                     </div>
@@ -2640,7 +2639,12 @@ export default function App() {
                         <Award className="w-4 h-4 text-amber-500" />
                         Índice Comparativo de Fiabilidad y Credibilidad
                       </h4>
-                      <div className="h-60">
+                      {selectedAnalysis.bibliographicSources.filter((x) => typeof x.reliabilityScore === "number").length === 0 && (
+                        <p className="text-xs text-slate-500 leading-snug bg-white border border-dashed border-slate-300 rounded-lg p-4">
+                          No hay fuentes con puntuación evaluable. La fiabilidad solo se calcula para obras que se han localizado y coinciden con un registro o con la web de un organismo; las demás figuran como «No verificada» y no reciben nota inventada.
+                        </p>
+                      )}
+                      <div className={selectedAnalysis.bibliographicSources.filter((x) => typeof x.reliabilityScore === "number").length === 0 ? "hidden" : "h-60"}>
                         <ResponsiveContainer width="100%" height="100%">
                           <BarChart
                             data={selectedAnalysis.bibliographicSources.filter((x) => typeof x.reliabilityScore === "number")}
