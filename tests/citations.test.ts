@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   titleSimilarity, surnameMatch, cleanDoi, reconstructAbstract, decideStatus, verifyCitation, assessSupport, scoreReliability,
-  resolveCitations, fromCrossref, fromOpenAlex, makeRegistry, type Registry, type RegistryRecord, type LlmJson,
+  resolveCitations, fromCrossref, fromOpenAlex, makeRegistry, parseHtmlMeta, isInstitutionalHost, verifyInstitutionalPage, type Registry, type RegistryRecord, type LlmJson, type PageFetcher,
 } from "../server/citations";
 
 const MARTI: RegistryRecord = {
@@ -154,4 +154,39 @@ test("registro: sin CONTACT_EMAIL no se envía mailto (no se inventa) y OpenAlex
   assert.ok(urls.every((u) => !u.includes("mailto") && !u.includes("example.com")));
   assert.equal(oaCalls, 1, "disyuntor tras el 429");
   assert.equal(reg.openalexEnabled(), false);
+});
+
+const EC_TITLE = "The 2024 Ageing Report: Economic and Budgetary Projections for the EU Member States (2022-2070)";
+const EC_HTML = `<html><head><title>2024 Ageing Report. Economic and Budgetary Projections for the EU Member States (2022-2070) - European Commission</title>
+<meta name="description" content="The report presents the projections showing the economic and budgetary impact of an ageing population over the long term."></head><body><h1>2024 Ageing Report</h1></body></html>`;
+const okPage = (html: string): PageFetcher => async (url) => ({ ok: true, html, finalUrl: url });
+
+test("CASO DE TU CAPTURA: un informe real de la Comisión Europea sin DOI en registros se verifica por su página (probable, nunca exact)", async () => {
+  const v = await verifyInstitutionalPage({ title: EC_TITLE, author: "European Commission (DG ECFIN)", year: 2024, url: "https://economy-finance.ec.europa.eu/publications/2024-ageing-report_en" }, okPage(EC_HTML));
+  assert.equal(v.status, "probable");
+  assert.equal(v.record?.institutional, true);
+  assert.match(v.record!.abstract!, /economic and budgetary impact/);
+  // por el flujo completo: los registros no lo conocen, la página sí
+  const out = await resolveCitations(fakeRegistry(), llm(() => [{ id: "s", verdict: "supports", quote: "economic and budgetary impact of an ageing population" }]),
+    [{ id: "s", claim: "Proyecta el gasto del envejecimiento en la UE", cited: { title: EC_TITLE, author: "European Commission", year: 2024, url: "https://economy-finance.ec.europa.eu/x" }, dropIfUnrelated: false }], "castellano", { fetchPage: okPage(EC_HTML) });
+  assert.equal(out[0].status, "probable");
+  assert.equal(out[0].support, "supports");
+  assert.ok(scoreReliability(out[0].record, "probable").score! >= 30, "un informe oficial verificado no queda en 'no evaluable'");
+});
+
+test("la página institucional que NO contiene el título citado se descarta (no basta con que la URL exista)", async () => {
+  const v = await verifyInstitutionalPage({ title: EC_TITLE, url: "https://ec.europa.eu/otra" }, okPage("<html><head><title>Press release: new tariffs on steel</title></head></html>"));
+  assert.equal(v.status, "not_found");
+  assert.equal(v.record, undefined);
+  const bad = await verifyInstitutionalPage({ title: EC_TITLE, url: "https://ec.europa.eu/otra" }, async () => null);
+  assert.equal(bad.status, "not_found");
+  assert.equal((await verifyInstitutionalPage({ title: EC_TITLE, url: "javascript:alert(1)" }, okPage(EC_HTML))).status, "not_found");
+});
+
+test("dominios institucionales reconocidos y metadatos HTML", () => {
+  for (const h of ["ec.europa.eu", "economy-finance.ec.europa.eu", "www.imf.org", "www.bde.es", "hacienda.gob.es", "www.congress.gov"]) assert.equal(isInstitutionalHost(h), true, h);
+  for (const h of ["blog.example.com", "europa.eu.evil.com", "notimf.org"]) assert.equal(isInstitutionalHost(h), false, h);
+  const m = parseHtmlMeta(EC_HTML);
+  assert.equal(m.titles.length, 2);
+  assert.ok(m.description);
 });
