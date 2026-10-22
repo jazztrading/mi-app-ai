@@ -247,3 +247,20 @@ test("cuota por minuto: se espera y se reintenta, y la afirmación acaba evaluad
   assert.equal(out.coverage.quota, undefined);
   assert.equal(out.claimChecks[0].verdict, "contradicted");
 });
+
+test("ESTABILIDAD: con las afirmaciones congeladas no se vuelve a extraer y se auditan exactamente las mismas, en el mismo orden", async () => {
+  const first = await runClaimAudit(makeDeps(), input);
+  let extractionCalls = 0;
+  const base = makeDeps();
+  const deps: AuditDeps = { ...base, llmJson: async (p, s, sc) => { if (s.includes("extrae afirmaciones")) extractionCalls++; return base.llmJson(p, s, sc); } };
+  const frozen = first.claimChecks.map((c) => ({ claim: c.claim, quote: c.quote, claimType: c.claimType, neutralQuestion: c.neutralQuestion!, importance: c.importance ?? 3 }));
+  const second = await runRaw(deps, input, { retryDelayMs: 0, frozenClaims: frozen, frozenExtracted: first.coverage.extracted });
+  assert.equal(extractionCalls, 0, "no se vuelve a llamar a la extracción");
+  assert.deepEqual(second.claimChecks.map((c) => c.claim), first.claimChecks.map((c) => c.claim));
+  assert.deepEqual(second.claimChecks.map((c) => c.id), first.claimChecks.map((c) => c.id));
+  assert.deepEqual(second.claimChecks.map((c) => c.verdict), first.claimChecks.map((c) => c.verdict));
+  assert.equal(second.coverage.claimsReused, true);
+  assert.equal(second.coverage.extracted, first.coverage.extracted);
+  assert.match(second.summaryAudit, /mismas afirmaciones de la auditoría anterior/);
+  assert.equal(first.coverage.claimsReused, undefined);
+});
