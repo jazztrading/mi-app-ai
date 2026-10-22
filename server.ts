@@ -16,6 +16,9 @@ import {
   makeRegistry, resolveCitations, verifyCitation, scoreReliability, locateFragment,
   type CitationInput, type CitationOutput, type FetchResult, type PageFetcher, type RegistryRecord, type StudyDesign, type SupportVerdict, type VerificationStatus,
 } from "./server/citations";
+import { CONTEXT_NOTES, matchContextNotes, renderNotesForPrompt, type ContextNoteView } from "./server/knowledge";
+import nodeCrypto from "node:crypto";
+import { PIPELINE_BASE_VERSION, MIN_FREEZE_CHARS, contentHash, seedFromHash, signAnalysis, findReusable, type FrozenInfo } from "./server/stability";
 import { runClaimAudit, rewriteWithCorrections, parseGeminiError, type AuditDeps, type ClaimCheck, type ClaimVerdict } from "./server/audit";
 
 // Load environment variables
@@ -66,6 +69,7 @@ interface CriticalPosition {
   critiqueType?: string;
   evidenceThatWouldSettleIt?: string;
   suggestedSources?: string[]; // instituciones o bases de datos a consultar (sin enlaces inventados)
+  contextNoteIds?: string[]; // notas de contexto curadas en las que se apoya (las fuentes las pone la app, no el modelo)
   supportingStudy?: VerifiedScholarlyCitation;
   studyDiscardedNote?: string;
 }
@@ -92,6 +96,7 @@ interface GlossaryTerm {
   scientificEvidenceOrSource?: string;
   evidenceVerification?: VerificationStatus;
   referenceUrl: string;
+  referenceKind?: "verified" | "search"; // "verified": obra localizada; "search": solo un enlace de búsqueda, NO una fuente verificada
 }
 
 export interface BibliographicSource {
@@ -150,7 +155,8 @@ export interface FactCheckAudit {
   auditedFrom?: "original_text" | "summary_only";
   claimChecks?: ClaimCheck[];
   counts?: Record<ClaimVerdict, number>;
-  coverage?: { extracted: number; considered: number; searched: number; notCheckable: number; textTruncated: boolean; maxClaims: number; searchFailed?: number; quota?: "day" | "minute" };
+  coverage?: { extracted: number; considered: number; searched: number; notCheckable: number; textTruncated: boolean; maxClaims: number; searchFailed?: number; quota?: "day" | "minute"; claimsReused?: boolean };
+  textHash?: string; // hash del texto auditado: si no cambia, se reutilizan las mismas afirmaciones
   previousExecutiveSummary?: string;
   previousKeyPoints?: string[];
 }
@@ -179,6 +185,8 @@ export interface AnalysisResult {
   fileNames?: string[];
   overallReliabilityScore?: number | null;
   scoutAssessment?: ScoutAssessment;
+  contextNotes?: ContextNoteView[];
+  frozen?: FrozenInfo; // firma de la capa auditada: permite reutilizar el análisis sin que fuentes ni críticas cambien
   factCheckAudit?: FactCheckAudit;
   isEditedManually?: boolean;
 }
@@ -243,6 +251,11 @@ function saveDatabase(dbData: Record<string, AnalysisResult>) {
 
 // ── Verificación de citas (Fase 1): la lógica vive en server/citations.ts ────────────────────────
 // Solo se consultan hosts fijos (Crossref, OpenAlex); no hay URL controlada por el usuario, así que no pasa por safeFetch.
+// Secreto para firmar la capa auditada. Define CACHE_SECRET en producción; si no, se deriva de la clave de Gemini (estable, no se expone).
+const CACHE_SECRET = process.env.CACHE_SECRET || nodeCrypto.createHash("sha256").update(`lupa-cache:${process.env.GEMINI_API_KEY || ""}`).digest("hex");
+// La versión incluye las notas de contexto: si se revisa una nota, los análisis antiguos dejan de reutilizarse.
+const pipelineVersion = () => `${PIPELINE_BASE_VERSION}+${nodeCrypto.createHash("sha256").update(CONTEXT_NOTES.map((n) => `${n.id}:${n.reviewedAt}`).join(",")).digest("hex").slice(0, 8)}`;
+
 const registryFetch = async (url: string): Promise<FetchResult> => {
   try {
     const contact = process.env.CONTACT_EMAIL;
@@ -358,7 +371,8 @@ async function generateAnalysisContentWithRetry(
   genContents: any,
   systemInstruction: string,
   responseSchemaConfig: any,
-  preferSearch: boolean = false
+  preferSearch: boolean = false,
+  seed?: number // semilla estable por contenido: mejor esfuerzo, Google no garantiza determinismo
 ): Promise<string> {
   // Strategy: Try primary gemini-3.8-flash, then fallback to gemini-flash-latest, then gemini-3.1-flash-lite
   const models = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"];
@@ -380,6 +394,7 @@ async function generateAnalysisContentWithRetry(
             responseSchema: responseSchemaConfig,
             temperature: 0.35,
           };
+          if (seed !== undefined) config.seed = seed;
 
           if (variation.useSearch) {
             config.tools = [{ googleSearch: {} }];
@@ -621,7 +636,7 @@ async function startServer() {
 
   // Main Analysis Endpoint
   app.post("/api/analyze", async (req, res) => {
-    const { url, manualText, contentType, images, image, files } = req.body;
+    const { url, manualText, contentType, images, image, files, fresh, previous } = req.body;
 
     // Collect all input files (PDF, Word, Images, etc.)
     const fileList: Array<{ name?: string; type?: string; data: string }> = [];
@@ -642,6 +657,7 @@ async function startServer() {
 
     try {
       let textToAnalyze = manualText || "";
+      let textIsFallback = false; // true si el scraping falló y solo se tiene la URL: NUNCA se congela un análisis sin texto real
       let finalUrl = url || "";
       const imageList: string[] = [];
       const documentNames: string[] = [];
@@ -894,6 +910,7 @@ async function startServer() {
           if (scrapeErr instanceof UnsafeUrlError) throw scrapeErr; // p. ej. redirección a IP privada → 400
           console.error("Error scraping URL, will rely on prompt context:", scrapeErr);
           textToAnalyze = `Analiza este ensayo o artículo de internet de la URL: ${url}. Título del recurso: ${title || url}`;
+          textIsFallback = true;
         }
       }
 
@@ -902,6 +919,22 @@ async function startServer() {
       }
 
       const detectedLang = detectLanguage(`${manualText || ""} ${textToAnalyze || ""}`);
+
+      // Estabilidad: si este mismo contenido ya se analizó con esta versión del pipeline, se reutiliza la capa auditada.
+      const freezeKey = contentParts.length === 0 && !textIsFallback && (textToAnalyze || "").length >= MIN_FREEZE_CHARS ? contentHash(textToAnalyze) : null;
+      const version = pipelineVersion();
+      if (freezeKey && fresh !== true) {
+        const reusable = findReusable([...Object.values(db), previous], CACHE_SECRET, freezeKey, version);
+        if (reusable && typeof reusable.id === "string" && ID_RE.test(reusable.id)) {
+          if (!db[reusable.id]) {
+            db[reusable.id] = reusable;
+            saveDatabase(db);
+          }
+          console.log(`[Estabilidad] Contenido ya analizado (${freezeKey.slice(0, 8)}): se reutiliza ${reusable.id}.`);
+          return res.json({ ...reusable, reused: true });
+        }
+      }
+      const seed = freezeKey ? seedFromHash(freezeKey) : undefined;
       const isGalego = detectedLang === "galego";
       const isCatala = detectedLang === "català";
 
@@ -1029,6 +1062,10 @@ ${textToAnalyze}
 `;
       }
 
+      // Notas de contexto curadas: solo se activan si el texto trata ese asunto; la comprobación de "qué reconoce el texto" es determinista
+      const contextNotes = matchContextNotes(textToAnalyze || "");
+      if (contextNotes.length > 0) userPrompt += `\n\n${renderNotesForPrompt(contextNotes)}\n`;
+
       const responseSchemaConfig = {
         type: Type.OBJECT,
         properties: {
@@ -1078,6 +1115,7 @@ ${textToAnalyze}
                 critiqueType: { type: Type.STRING, enum: ["definicion_perimetro", "medicion", "causal", "institucional_contable", "empirica", "logica", "normativa"] },
                 evidenceThatWouldSettleIt: { type: Type.STRING, description: "Qué dato o documento resolvería la duda y quién lo publica." },
                 suggestedSources: { type: Type.ARRAY, items: { type: Type.STRING }, description: "Nombres de instituciones o bases de datos a consultar. Sin enlaces." },
+                contextNoteIds: { type: Type.ARRAY, items: { type: Type.STRING }, description: "Ids de las NOTAS DE CONTEXTO en las que se apoya esta posición, si las hay." },
                 empiricalStudy: {
                   type: Type.OBJECT,
                   description: "OPCIONAL: solo si recuerdas con certeza un estudio real que trate específicamente este argumento.",
@@ -1173,7 +1211,8 @@ ${textToAnalyze}
           genContents,
           systemInstruction,
           responseSchemaConfig,
-          isFactualElectionQuery
+          isFactualElectionQuery,
+          seed
         );
       } catch (genErr: any) {
         console.error("Gemini generation error:", genErr);
@@ -1210,7 +1249,7 @@ ${textToAnalyze}
       try {
         citeOutputs = await resolveCitations(
           newRegistry(),
-          (prompt, system, schema) => generateAnalysisContentWithRetry(prompt, system, schema, false),
+          (prompt, system, schema) => generateAnalysisContentWithRetry(prompt, system, schema, false, seed),
           citeInputs,
           detectedLang,
           { fetchPage: pageFetcher }
@@ -1233,6 +1272,7 @@ ${textToAnalyze}
           critiqueType: crit.critiqueType || undefined,
           evidenceThatWouldSettleIt: crit.evidenceThatWouldSettleIt || undefined,
           suggestedSources: Array.isArray(crit.suggestedSources) ? crit.suggestedSources.filter((x: any) => typeof x === "string" && x.trim()).slice(0, 4) : undefined,
+          contextNoteIds: Array.isArray(crit.contextNoteIds) ? crit.contextNoteIds.filter((id: any) => contextNotes.some((n) => n.id === id)) : undefined, // solo ids de notas realmente activadas
           supportingStudy: o?.record ? toCitationView(o.record, o) : undefined,
           studyDiscardedNote: o?.discarded ? `El estudio que propuso el modelo («${o.discarded.title}») se descartó: ${o.discarded.reason}.` : undefined,
         };
@@ -1296,16 +1336,17 @@ ${textToAnalyze}
 
       for (const g of rawGlossary) {
         const verifiedEv = await verifyGlossaryEvidence(g.scientificEvidenceOrSource, g.term || "", contextKeywords);
-        let cleanRef = verifiedEv.verifiedUrl || g.referenceUrl || "";
-        if (!cleanRef || !cleanRef.startsWith("http")) {
-          cleanRef = `https://scholar.google.com/scholar?q=${encodeURIComponent(g.term)}`;
-        }
+        // Las URL escritas por el modelo pueden estar rotas o inventadas: no se usan nunca. Solo se enlaza una obra verificada;
+        // en cualquier otro caso, un enlace de búsqueda etiquetado como tal.
+        const isVerifiedRef = (verifiedEv.status === "exact" || verifiedEv.status === "probable") && !!verifiedEv.verifiedUrl;
+        const cleanRef = isVerifiedRef ? (verifiedEv.verifiedUrl as string) : scholarSearchLink(g.term || "");
         sanitizedGlossary.push({
           term: g.term || "",
           definition: g.definition || "",
           simpleExample: g.simpleExample || "",
           scientificEvidenceOrSource: verifiedEv.evidenceText || g.scientificEvidenceOrSource || undefined,
           evidenceVerification: verifiedEv.status,
+          referenceKind: isVerifiedRef ? "verified" : "search",
           referenceUrl: cleanRef
         });
       }
@@ -1338,12 +1379,15 @@ ${textToAnalyze}
         glossary: sanitizedGlossary,
         bibliographicSources: sanitizedSources,
         scoutAssessment: sanitizeScout(result.scoutAssessment),
+        contextNotes: contextNotes.length ? contextNotes : undefined,
         analyzedAt: new Date().toISOString(),
         contentType: isDoc ? "document" : (isPhoto ? "photo" : (contentType || "blog")),
         photoUrls: imageList.length > 0 ? imageList : undefined,
         fileNames: documentNames.length > 0 ? documentNames : undefined,
         overallReliabilityScore: overallReliabilityScore
       };
+
+      if (freezeKey) analysis.frozen = signAnalysis(CACHE_SECRET, analysis, freezeKey, version);
 
       // Save in our persistent database
       db[analysisId] = analysis;
@@ -1455,8 +1499,20 @@ ${targetText.substring(0, 45000)}`;
       const outputLang = analysis.outputLanguage || detectLanguage(`${analysis.title} ${analysis.executiveSummary}`);
       console.log(`[Audit v2] Auditoría por afirmaciones de "${analysis.title}" (idioma: ${outputLang})...`);
 
+      // Estabilidad: mismo texto auditado → mismas afirmaciones (solo se repite la comprobación de la evidencia)
+      const hasOriginalText = !!analysis.originalExtractedText && analysis.originalExtractedText.trim().length >= 200;
+      const auditHash = analysis.frozen?.contentHash || contentHash(hasOriginalText ? analysis.originalExtractedText! : analysis.executiveSummary);
+      const prevAudit = analysis.factCheckAudit;
+      const reuseClaims =
+        req.body?.freshClaims !== true &&
+        prevAudit?.method === "claim_level_v2" &&
+        prevAudit.textHash === auditHash &&
+        Array.isArray(prevAudit.claimChecks) &&
+        prevAudit.claimChecks.length > 0 &&
+        prevAudit.claimChecks.every((c) => typeof c.neutralQuestion === "string");
+
       const deps: AuditDeps = {
-        llmJson: (prompt, system, schema) => generateAnalysisContentWithRetry(prompt, system, schema, false),
+        llmJson: (prompt, system, schema) => generateAnalysisContentWithRetry(prompt, system, schema, false, seedFromHash(auditHash)),
         groundedSearch: (prompt) => generateGroundedSearchText(prompt, undefined, { strict: true }),
       };
 
@@ -1466,7 +1522,12 @@ ${targetText.substring(0, 45000)}`;
         sourceText: analysis.originalExtractedText,
         summary: analysis.executiveSummary,
         keyPoints: analysis.keyPoints,
-      });
+      }, reuseClaims && prevAudit
+        ? {
+            frozenClaims: prevAudit.claimChecks!.map((c) => ({ claim: c.claim, quote: c.quote, claimType: c.claimType, neutralQuestion: c.neutralQuestion!, importance: c.importance ?? 3 })),
+            frozenExtracted: prevAudit.coverage?.extracted,
+          }
+        : {});
 
       // Solo se reescribe el resumen con correcciones fuertes (contradichas, confianza >= 0.7, con fuente real).
       // El texto previo se conserva para poder revertir.
@@ -1502,6 +1563,7 @@ ${targetText.substring(0, 45000)}`;
         claimChecks: outcome.claimChecks,
         counts: outcome.counts,
         coverage: outcome.coverage,
+        textHash: auditHash,
         previousExecutiveSummary,
         previousKeyPoints,
       };
