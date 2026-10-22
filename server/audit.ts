@@ -28,6 +28,8 @@ export interface ClaimCheck {
   evidenceQuote?: string; // frase corta literal de la evidencia que sostiene el veredicto
   evidence: Array<{ title: string; url: string }>; // solo fuentes reales devueltas por el buscador
   searchFailed?: boolean; // la búsqueda falló técnicamente: NO equivale a "no hay evidencia"
+  neutralQuestion?: string; // se guarda para poder volver a auditar EXACTAMENTE las mismas afirmaciones
+  importance?: number;
 }
 
 export interface AuditDeps {
@@ -46,7 +48,7 @@ export interface AuditInput {
 export interface AuditOutcome {
   claimChecks: ClaimCheck[];
   counts: Record<ClaimVerdict, number>;
-  coverage: { extracted: number; considered: number; searched: number; notCheckable: number; textTruncated: boolean; maxClaims: number; searchFailed: number; quota?: "day" | "minute" };
+  coverage: { extracted: number; considered: number; searched: number; notCheckable: number; textTruncated: boolean; maxClaims: number; searchFailed: number; quota?: "day" | "minute"; claimsReused?: boolean };
   auditedFrom: "original_text" | "summary_only";
   status: "verified" | "corrected" | "inconclusive";
   summaryAudit: string;
@@ -338,6 +340,7 @@ const T: Record<string, Record<string, string>> = {
     failExplain: "Falló la búsqueda de evidencia ({err}). Esto no significa que no exista evidencia: vuelve a intentarlo más tarde.",
     failNote: "AVISO: la búsqueda de evidencia falló por un error técnico en {f} de {n} afirmaciones comprobables; ese resultado NO indica ausencia de evidencia. Vuelve a intentarlo más tarde.",
     failedCount: "{f} sin comprobar por fallo de búsqueda.",
+    claimsReused: "Se han reutilizado las mismas afirmaciones de la auditoría anterior para que los resultados sean comparables; solo se ha repetido la comprobación de la evidencia.",
     quotaDay: "CUOTA DIARIA DE GEMINI AGOTADA: Google limita las peticiones por proyecto y por día, y se reinicia a medianoche (hora del Pacífico). No se han gastado más peticiones en este informe. Vuelve a auditar después o consulta el panel de límites de AI Studio.",
   },
   galego: {
@@ -354,6 +357,7 @@ const T: Record<string, Record<string, string>> = {
     failExplain: "Fallou a busca de evidencia ({err}). Isto non significa que non exista evidencia: volve tentalo máis tarde.",
     failNote: "AVISO: a busca de evidencia fallou por un erro técnico en {f} de {n} afirmacións comprobables; ese resultado NON indica ausencia de evidencia. Volve tentalo máis tarde.",
     failedCount: "{f} sen comprobar por fallo de busca.",
+    claimsReused: "Reutilizáronse as mesmas afirmacións da auditoría anterior para que os resultados sexan comparables; só se repetiu a comprobación da evidencia.",
     quotaDay: "CUOTA DIARIA DE GEMINI ESGOTADA: Google limita as peticións por proxecto e por día, e reiníciase á medianoite (hora do Pacífico). Non se gastaron máis peticións neste informe. Volve auditar despois ou consulta o panel de límites de AI Studio.",
   },
   català: {
@@ -370,6 +374,7 @@ const T: Record<string, Record<string, string>> = {
     failExplain: "Ha fallat la cerca d'evidència ({err}). Això no vol dir que no n'hi hagi: torna-ho a provar més tard.",
     failNote: "AVÍS: la cerca d'evidència ha fallat per un error tècnic en {f} de {n} afirmacions comprovables; aquest resultat NO indica absència d'evidència. Torna-ho a provar més tard.",
     failedCount: "{f} sense comprovar per error de cerca.",
+    claimsReused: "S'han reutilitzat les mateixes afirmacions de l'auditoria anterior perquè els resultats siguin comparables; només s'ha repetit la comprovació de l'evidència.",
     quotaDay: "QUOTA DIÀRIA DE GEMINI ESGOTADA: Google limita les peticions per projecte i per dia, i es reinicia a mitjanit (hora del Pacífic). No s'han gastat més peticions en aquest informe. Torna a auditar després o consulta el panell de límits d'AI Studio.",
   },
 };
@@ -400,6 +405,7 @@ export function buildSummary(args: {
   parts.push(result);
   if (failed > 0) parts.push(fill(t.failNote, { f: failed, n: cv.searched }));
   if (cv.quota === "day") parts.push(t.quotaDay);
+  if (cv.claimsReused) parts.push(t.claimsReused);
 
   const contra = args.checks.filter((c) => c.verdict === "contradicted");
   const partial = args.checks.filter((c) => c.verdict === "partially_supported");
@@ -417,7 +423,13 @@ export function buildSummary(args: {
 }
 
 // ── orquestación ─────────────────────────────────────────────────────────────
-export async function runClaimAudit(deps: AuditDeps, input: AuditInput, opts: { retryDelayMs?: number; concurrency?: number } = {}): Promise<AuditOutcome> {
+export async function runClaimAudit(deps: AuditDeps, input: AuditInput, opts: {
+    retryDelayMs?: number;
+    concurrency?: number;
+    /** Afirmaciones de una auditoría anterior sobre el MISMO texto: se reutilizan en lugar de volver a extraerlas. */
+    frozenClaims?: Array<{ claim: string; quote: string; claimType: ClaimType; neutralQuestion: string; importance: number }>;
+    frozenExtracted?: number;
+  } = {}): Promise<AuditOutcome> {
   const hasOriginal = !!input.sourceText && input.sourceText.trim().length >= MIN_SOURCE_TEXT;
   const auditedFrom: AuditOutcome["auditedFrom"] = hasOriginal ? "original_text" : "summary_only";
   const fullText = hasOriginal
@@ -427,8 +439,8 @@ export async function runClaimAudit(deps: AuditDeps, input: AuditInput, opts: { 
   const text = fullText.slice(0, AUDIT_TEXT_CAP);
 
   // 1) extraer
-  const raw = await extractClaims(deps, text, input.lang);
-  const extracted = raw.length;
+  const raw: RawClaim[] = opts.frozenClaims && opts.frozenClaims.length ? opts.frozenClaims : await extractClaims(deps, text, input.lang);
+  const extracted = opts.frozenClaims && opts.frozenClaims.length ? Math.max(opts.frozenExtracted ?? 0, raw.length) : raw.length;
   // priorizar por importancia y limitar coste; los hechos comprobables primero
   const considered = [...raw]
     .sort((a, b) => b.importance - a.importance)
@@ -488,6 +500,8 @@ export async function runClaimAudit(deps: AuditDeps, input: AuditInput, opts: { 
       quote: located ? c.quote : "",
       quoteLocated: located,
       claimType: c.claimType,
+      neutralQuestion: c.neutralQuestion,
+      importance: c.importance,
     };
     if (c.claimType === "opinion" || c.claimType === "prediction") {
       return {
@@ -536,6 +550,7 @@ export async function runClaimAudit(deps: AuditDeps, input: AuditInput, opts: { 
     maxClaims: AUDIT_MAX_CLAIMS,
     searchFailed: claimChecks.filter((c) => c.searchFailed).length,
     quota: dayQuotaHit ? ("day" as const) : undefined,
+    claimsReused: opts.frozenClaims && opts.frozenClaims.length ? true : undefined,
   };
 
   const hasProblem = claimChecks.some((c) => (c.verdict === "contradicted" || c.verdict === "partially_supported") && c.confidence >= 0.5);

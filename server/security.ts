@@ -125,6 +125,10 @@ function checkDataString(data: unknown, name?: string, type?: string) {
 export function validateAnalyzeBody(body: any): void {
   if (!body || typeof body !== "object") throw new HttpError(400, "Cuerpo de petición no válido.");
   const { url, manualText, contentType, images, image, files } = body;
+  if (body.fresh !== undefined && typeof body.fresh !== "boolean") throw new HttpError(400, "`fresh` debe ser booleano.");
+  if (body.previous !== undefined && body.previous !== null && (typeof body.previous !== "object" || Array.isArray(body.previous))) {
+    throw new HttpError(400, "`previous` debe ser un objeto.");
+  }
   if (url !== undefined && url !== null && url !== "" && (typeof url !== "string" || url.length > 2048)) {
     throw new HttpError(400, "La URL no es válida (tipo o longitud).");
   }
