@@ -78,6 +78,17 @@ interface VerifiedScholarlyCitation {
 type VerificationStatus = "exact" | "probable" | "related_unverified" | "not_found";
 type SupportVerdict = "supports" | "contradicts" | "mixed" | "unrelated" | "unassessed";
 
+interface ContextNoteView {
+  id: string;
+  title: string;
+  reviewedAt: string;
+  statement: string;
+  whyItMatters: string;
+  checks: Array<{ label: string; mentioned: boolean; snippet?: string }>;
+  sources: Array<{ title: string; publisher: string; url: string; kind: "primaria" | "secundaria"; supports: string }>;
+  caveats: string[];
+}
+
 interface ScoutAssessment {
   whereAuthorIsRight: string[];
   strongestVersion: string;
@@ -122,6 +133,7 @@ interface CriticalPosition {
   critiqueType?: string;
   evidenceThatWouldSettleIt?: string;
   suggestedSources?: string[];
+  contextNoteIds?: string[];
   supportingStudy?: VerifiedScholarlyCitation;
   studyDiscardedNote?: string;
 }
@@ -137,7 +149,9 @@ interface GlossaryTerm {
   definition: string;
   simpleExample?: string;
   scientificEvidenceOrSource?: string;
+  evidenceVerification?: VerificationStatus;
   referenceUrl: string;
+  referenceKind?: "verified" | "search";
 }
 
 interface NumericalExample {
@@ -221,6 +235,13 @@ interface FactCheckAudit {
   userFeedback?: string;
 }
 
+interface FrozenInfo {
+  contentHash: string;
+  pipelineVersion: string;
+  frozenAt: string;
+  sig: string;
+}
+
 interface AnalysisResult {
   id: string;
   url: string;
@@ -245,6 +266,8 @@ interface AnalysisResult {
   fileNames?: string[];
   overallReliabilityScore?: number | null;
   scoutAssessment?: ScoutAssessment;
+  contextNotes?: ContextNoteView[];
+  frozen?: FrozenInfo;
   factCheckAudit?: FactCheckAudit;
   isEditedManually?: boolean;
 }
@@ -293,6 +316,8 @@ export default function App() {
   });
 
   const [error, setError] = useState<string | null>(null);
+  const [freshRun, setFreshRun] = useState(false); // pedir un análisis nuevo aunque el contenido ya esté analizado
+  const [reuseNotice, setReuseNotice] = useState<string | null>(null);
   const [copiedNotion, setCopiedNotion] = useState(false);
   const [translationCopied, setTranslationCopied] = useState(false);
   const [isTranslatingFull, setIsTranslatingFull] = useState(false);
@@ -667,6 +692,7 @@ export default function App() {
       "Evaluando el rigor académico y calculando índices de credibilidad..."
     ];
 
+    setReuseNotice(null);
     let stepIndex = 0;
     setLoadingStep(steps[0]);
     const stepInterval = setInterval(() => {
@@ -685,10 +711,12 @@ export default function App() {
         images: filesToUse.filter(f => f.type === "image").map(f => f.dataUrl)
       };
 
+      // Estabilidad: si esta URL ya se analizó en este navegador, se envía ese análisis (el servidor comprueba su firma y que el contenido no ha cambiado)
+      const previousMatch = !freshRun && payload.url ? analyses.find((a) => a.url === payload.url && a.frozen) : undefined;
       const res = await apiFetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
+        body: JSON.stringify({ ...payload, fresh: freshRun, previous: previousMatch })
       });
 
       let responseData: any;
@@ -703,7 +731,10 @@ export default function App() {
         throw new Error(responseData?.error || `Error del servidor (${res.status}).`);
       }
 
-      const result: AnalysisResult = responseData;
+      const { reused, ...analysisData } = responseData;
+      const result: AnalysisResult = analysisData;
+      setReuseNotice(reused ? "Este contenido ya estaba analizado: se reutiliza ese análisis, así que fuentes, críticas y papers no cambian. Marca «Reanalizar desde cero» si quieres uno nuevo (puede dar resultados distintos)." : null);
+      setFreshRun(false);
       
       // Update states and localStorage
       setAnalyses(prev => {
@@ -863,6 +894,7 @@ export default function App() {
         md += `### Posición ${i + 1}: ${crit.title}\n\n`;
         md += `- **Argumento:** ${crit.argument}\n`;
         md += `- **Fundamento Científico/Empírico:** ${crit.scientificBasis}\n`;
+        if (crit.contextNoteIds?.length) md += `- **Se apoya en nota de contexto verificada:** ${crit.contextNoteIds.join(", ")}\n`;
         if (crit.targetClaim) md += `- **Se refiere a:** «${crit.targetClaim}»\n`;
         if (crit.evidenceThatWouldSettleIt) md += `- **Qué evidencia lo resolvería:** ${crit.evidenceThatWouldSettleIt}${crit.suggestedSources?.length ? ` (consultar: ${crit.suggestedSources.join("; ")})` : ""}\n`;
         if (crit.studyDiscardedNote) md += `- _${crit.studyDiscardedNote}_\n`;
@@ -915,7 +947,7 @@ export default function App() {
           md += `- **Evidencia Científica y Fuente Probada:** ${term.scientificEvidenceOrSource}\n`;
         }
         if (term.referenceUrl) {
-          md += `- **Referencia Académica:** [Consultar en Repositorio Oficial](${term.referenceUrl})\n`;
+          md += `- **Referencia:** [${term.referenceKind === "verified" ? "Referencia verificada" : term.referenceKind === "search" ? "Búsqueda en Google Académico (no es una fuente verificada)" : "Enlace antiguo del modelo (no verificado)"}](${term.referenceUrl})\n`;
         }
         md += `\n`;
       });
@@ -1258,6 +1290,13 @@ export default function App() {
                 </div>
               )}
 
+              <label className="mt-4 flex items-start gap-2 text-[11.5px] text-slate-600 leading-snug cursor-pointer">
+                <input type="checkbox" checked={freshRun} onChange={(e) => setFreshRun(e.target.checked)} className="mt-0.5 accent-slate-900" />
+                <span>
+                  <strong className="text-slate-800">Reanalizar desde cero.</strong> Por defecto, si el contenido ya se analizó, se reutiliza el análisis para que fuentes, críticas y papers <em>no cambien</em> entre ejecuciones.
+                </span>
+              </label>
+
               <button
                 onClick={() => startAnalysis()}
                 disabled={loading || (activeTab === "url" ? !url : activeTab === "photo" ? selectedFiles.length === 0 : !manualText)}
@@ -1275,6 +1314,10 @@ export default function App() {
                   </>
                 )}
               </button>
+
+              {reuseNotice && !error && (
+                <div className="mt-4 p-3.5 bg-sky-50 border border-sky-200 rounded-lg text-xs text-sky-900 leading-snug animate-fadeIn">{reuseNotice}</div>
+              )}
 
               {error && (
                 <div className="mt-4 p-3.5 bg-rose-50 border border-rose-200 rounded-lg text-xs text-rose-800 space-y-2.5 animate-fadeIn">
@@ -2143,6 +2186,51 @@ export default function App() {
                     </div>
                   )}
 
+                  {/* Contexto institucional verificado: notas curadas con fuentes; "qué reconoce el texto" se comprueba sin IA */}
+                  {selectedAnalysis.contextNotes && selectedAnalysis.contextNotes.length > 0 && selectedAnalysis.contextNotes.map((note) => (
+                    <div key={note.id} className="bg-white border border-indigo-200/80 rounded-xl p-6 shadow-xs">
+                      <div className="flex items-start justify-between gap-2 mb-3 pb-3 border-b border-indigo-100">
+                        <h3 className="text-lg font-display font-semibold text-slate-900 flex items-center gap-2">
+                          <BookOpen className="w-5 h-5 text-indigo-600 shrink-0" />
+                          Contexto institucional verificado
+                        </h3>
+                        <span className="text-[10px] font-mono text-indigo-700 bg-indigo-50 border border-indigo-200 px-2 py-0.5 rounded-full shrink-0">Nota curada · revisada {note.reviewedAt}</span>
+                      </div>
+                      <h4 className="text-sm font-semibold text-slate-900 mb-1.5">{note.title}</h4>
+                      <p className="text-xs text-slate-700 leading-relaxed mb-2">{note.statement}</p>
+                      <p className="text-xs text-slate-600 leading-relaxed mb-4"><strong className="text-slate-800">Por qué importa:</strong> {note.whyItMatters}</p>
+
+                      <h5 className="text-[11px] font-mono font-semibold text-slate-600 uppercase tracking-wider mb-2">Qué recoge el texto analizado (comprobación automática, sin IA)</h5>
+                      <ul className="space-y-1.5 mb-4 text-xs">
+                        {note.checks.map((c) => (
+                          <li key={c.label} className="flex gap-2 leading-snug">
+                            <span className={`font-bold shrink-0 ${c.mentioned ? "text-emerald-700" : "text-rose-700"}`}>{c.mentioned ? "Sí" : "No"}</span>
+                            <span className="text-slate-700">
+                              {c.label}
+                              {c.snippet && <span className="block text-[11px] text-slate-500 italic">«{c.snippet}»</span>}
+                            </span>
+                          </li>
+                        ))}
+                      </ul>
+
+                      <h5 className="text-[11px] font-mono font-semibold text-slate-600 uppercase tracking-wider mb-2">Fuentes</h5>
+                      <ul className="space-y-2 mb-4 text-xs">
+                        {note.sources.map((src) => (
+                          <li key={src.url} className="leading-snug">
+                            <a href={src.url} target="_blank" rel="noreferrer" className="text-indigo-700 hover:text-indigo-900 underline font-medium">{src.title}</a>
+                            <span className="text-slate-500"> · {src.publisher} · fuente {src.kind}</span>
+                            <span className="block text-slate-600">{src.supports}</span>
+                          </li>
+                        ))}
+                      </ul>
+
+                      <div className="p-3 bg-amber-50/70 border border-amber-200 rounded-lg text-[11.5px] text-amber-900 leading-snug">
+                        <strong>Cautelas:</strong>
+                        <ul className="list-disc pl-4 mt-1 space-y-0.5">{note.caveats.map((c, i) => <li key={i}>{c}</li>)}</ul>
+                      </div>
+                    </div>
+                  ))}
+
                   {/* Evaluación de explorador: antes de criticar, lo que acierta el autor y qué cambiaría la conclusión */}
                   {selectedAnalysis.scoutAssessment && (
                     <div className="bg-white border border-sky-200/80 rounded-xl p-6 shadow-xs">
@@ -2245,6 +2333,11 @@ export default function App() {
                                   <span className="block mt-1 text-slate-500">Dónde consultarla (la app no lo ha consultado): {crit.suggestedSources.join(" · ")}</span>
                                 )}
                               </div>
+                            )}
+                            {crit.contextNoteIds && crit.contextNoteIds.length > 0 && (
+                              <p className="text-[11px] text-sky-900 bg-sky-50 border border-sky-200 rounded-lg px-2.5 py-1.5 leading-snug">
+                                Se apoya en la nota de contexto verificada: {crit.contextNoteIds.map((id) => selectedAnalysis.contextNotes?.find((n) => n.id === id)?.title || id).join(" · ")} (ver tarjeta «Contexto institucional verificado»).
+                              </p>
                             )}
                             {crit.studyDiscardedNote && (
                               <p className="text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1.5 leading-snug">{crit.studyDiscardedNote}</p>
@@ -2466,9 +2559,13 @@ export default function App() {
                               {/* Scientific Evidence and Proven Foundation */}
                               {item.scientificEvidenceOrSource && (
                                 <div className="p-3 bg-emerald-50/80 border border-emerald-200/70 rounded-lg text-xs space-y-1.5">
-                                  <div className="flex items-center gap-1.5 text-emerald-950 font-semibold text-[11px]">
-                                    <ShieldCheck className="w-3.5 h-3.5 text-emerald-700 shrink-0" />
-                                    <span>Evidencia Científica & Fuente Comprobable</span>
+                                  <div className={`flex items-center gap-1.5 font-semibold text-[11px] ${item.evidenceVerification === "exact" || item.evidenceVerification === "probable" ? "text-emerald-950" : "text-amber-900"}`}>
+                                    <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
+                                    <span>
+                                      {item.evidenceVerification === "exact" || item.evidenceVerification === "probable"
+                                        ? "Fuente localizada en un registro académico"
+                                        : "Fuente citada por el modelo (no verificada)"}
+                                    </span>
                                   </div>
                                   <p className="text-slate-700 leading-relaxed text-[11.5px] font-normal">
                                     {item.scientificEvidenceOrSource}
@@ -2487,7 +2584,13 @@ export default function App() {
                                   className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-amber-900 bg-amber-50 hover:bg-amber-100 border border-amber-200/90 px-2.5 py-1 rounded-md transition-colors shadow-2xs"
                                   title={`Consultar fuente educativa para ${item.term}`}
                                 >
-                                  <span>Consultar en Repositorio Oficial</span>
+                                  <span>
+                                    {item.referenceKind === "verified"
+                                      ? "Ver la referencia verificada"
+                                      : item.referenceKind === "search"
+                                      ? "Buscar en Google Académico (búsqueda, no una fuente verificada)"
+                                      : "Enlace antiguo del modelo (no verificado)"}
+                                  </span>
                                   <ExternalLink className="w-3 h-3 text-amber-700" />
                                 </a>
                               </div>
