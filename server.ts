@@ -20,6 +20,10 @@ import { CONTEXT_NOTES, matchContextNotes, renderNotesForPrompt, type ContextNot
 import nodeCrypto from "node:crypto";
 import { PIPELINE_BASE_VERSION, MIN_FREEZE_CHARS, contentHash, seedFromHash, signAnalysis, findReusable, type FrozenInfo } from "./server/stability";
 import { runClaimAudit, rewriteWithCorrections, parseGeminiError, type AuditDeps, type ClaimCheck, type ClaimVerdict } from "./server/audit";
+import {
+  findAudioCandidates, isDirectAudioUrl, transcribePodcast, transcribeYouTubeVideo, transcribeImages, mediaNoteFor,
+  type TranscriptInfo, type MediaDeps,
+} from "./server/media";
 
 // Load environment variables
 dotenv.config();
@@ -41,6 +45,10 @@ const ai = new GoogleGenAI({
     }
   }
 });
+// Modelos para transcribir audio/vídeo y hacer OCR (mismo orden de respaldo que el resto del pipeline)
+const mediaDeps: MediaDeps = { ai, models: ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"] };
+// Tope de caracteres del texto que se envía a analizar (una transcripción de ~2 h cabe de sobra)
+const MAX_MEDIA_TEXT_CHARS = 400_000;
 
 export interface VerifiedScholarlyCitation {
   title: string;
@@ -171,6 +179,9 @@ export interface AnalysisResult {
   categories: string[];
   translation?: string;
   originalExtractedText?: string;
+  /** Transcripción del audio/vídeo (con marcas de tiempo) o texto OCR de las fotos. Distinta de `translation`. */
+  transcript?: string;
+  transcriptInfo?: TranscriptInfo;
   executiveSummary: string;
   keyPoints: string[];
   numericalExamples?: NumericalExample[];
@@ -659,6 +670,9 @@ async function startServer() {
       let textToAnalyze = manualText || "";
       let textIsFallback = false; // true si el scraping falló y solo se tiene la URL: NUNCA se congela un análisis sin texto real
       let finalUrl = url || "";
+      let transcript: string | undefined; // transcripción de audio/vídeo u OCR de fotos (se muestra aparte)
+      let transcriptInfo: TranscriptInfo | undefined;
+      let effectiveContentType: string | undefined = contentType;
       const imageList: string[] = [];
       const documentNames: string[] = [];
       const contentParts: any[] = [];
@@ -727,6 +741,29 @@ async function startServer() {
         }
       }
 
+      // Fotos: paso OCR dedicado. El texto literal se puede revisar, se audita y permite reutilizar el análisis
+      // (con las imágenes dentro de la llamada de análisis no había texto que congelar ni que auditar).
+      let ocrApplied = false;
+      if (imageList.length > 0 && process.env.OCR_PREPASS !== "false") {
+        try {
+          const imageParts = contentParts
+            .filter((p) => p?.inlineData?.mimeType?.startsWith("image/"))
+            .map((p) => ({ mimeType: p.inlineData.mimeType as string, data: p.inlineData.data as string }));
+          const ocr = await transcribeImages(mediaDeps, imageParts);
+          if (ocr.text.length >= 80) {
+            ocrApplied = true;
+            transcript = ocr.text;
+            transcriptInfo = { source: "ocr", generatedBy: "ia", complete: true, model: ocr.model, note: "Texto leído de la(s) foto(s) por IA; revisa cifras y nombres propios." };
+            extractedDocsText += `\n\n--- TEXTO TRANSCRITO DE LA(S) FOTOGRAFÍA(S) (OCR automático) ---\n${ocr.text}\n--- FIN DEL TEXTO TRANSCRITO ---`;
+            for (let i = contentParts.length - 1; i >= 0; i--) {
+              if (contentParts[i]?.inlineData?.mimeType?.startsWith("image/")) contentParts.splice(i, 1);
+            }
+          }
+        } catch (ocrErr) {
+          console.warn("OCR previo fallido; se analizan las imágenes directamente:", ocrErr);
+        }
+      }
+
       if (extractedDocsText) {
         textToAnalyze = (textToAnalyze ? textToAnalyze + "\n\n" : "") + extractedDocsText;
       }
@@ -737,6 +774,14 @@ async function startServer() {
       } else if (imageList.length > 0) {
         title = "Artículo en Fotografía";
       }
+
+      // Reutiliza la transcripción de un análisis anterior de la misma URL: transcribir cuesta minutos y cuota.
+      const podcastTranscript = async (candidates: string[], pageTitle: string) => {
+        const prev = fresh === true ? undefined : Object.values(db).find((a) => a.url === url && a.transcript && a.transcriptInfo?.source === "audio" && a.transcriptInfo.complete);
+        if (prev?.transcript && prev.transcriptInfo) return { ok: true as const, text: prev.transcript, info: prev.transcriptInfo };
+        const r = await transcribePodcast(mediaDeps, candidates, { title: pageTitle });
+        return r.ok ? { ok: true as const, text: r.text!, info: r.info! } : { ok: false as const, error: r.error || "motivo desconocido" };
+      };
 
       // If a URL was provided, attempt to fetch and scrape the page
       if (url) {
@@ -797,6 +842,26 @@ async function startServer() {
                 }
               }
 
+              // Subtítulos ausentes o mínimos (frecuente en servidores cloud): Gemini procesa el vídeo público por URL.
+              if (transcriptText.length >= 400) {
+                transcriptInfo = { source: "youtube-captions", generatedBy: "subtitulos", complete: true, note: "Subtítulos de YouTube: pueden ser automáticos y sin puntuación." };
+              } else if (process.env.YOUTUBE_AI_TRANSCRIPT !== "false") {
+                try {
+                  const yt = await transcribeYouTubeVideo(mediaDeps, videoId ? `https://www.youtube.com/watch?v=${videoId}` : url, { title: videoTitle || title });
+                  if (yt.text.length >= 200) {
+                    transcriptText = yt.text;
+                    transcriptInfo = { source: "youtube-video", generatedBy: "ia", complete: yt.complete, model: yt.model, passes: yt.passes, note: yt.note };
+                  }
+                } catch (ytAiErr: any) {
+                  console.warn("Transcripción IA del vídeo de YouTube no disponible:", String(ytAiErr?.message || ytAiErr).slice(0, 300));
+                }
+              }
+              if (transcriptText && !transcriptInfo) {
+                transcriptInfo = { source: "youtube-captions", generatedBy: "subtitulos", complete: false, note: "Subtítulos muy breves: puede faltar contenido." };
+              }
+              if (transcriptText) transcript = transcriptText;
+              effectiveContentType = "youtube";
+
               // 3. Build rich context for Gemini
               let ytContext = `--- RECURSO MULTIMEDIA DE YOUTUBE ---\n`;
               ytContext += `Título Oficial del Vídeo: "${videoTitle || title}"\n`;
@@ -807,7 +872,9 @@ async function startServer() {
               if (transcriptText) {
                 ytContext += `\nTranscripción completa del audio / subtítulos del vídeo:\n${transcriptText}\n`;
               } else {
-                ytContext += `\nNota: Este vídeo es un recurso audiovisual/tutorial/demostración (sin subtítulos hablados o con música/instrucción visual directa). El análisis DEBE centrarse con total precisión en el tema de ESTE VÍDEO ("${videoTitle || title}" del canal "${channelName || 'el autor'}") y sus técnicas, metodología, conceptos y disciplina correspondiente.\n`;
+                ytContext += `\nAVISO: no se ha podido obtener la transcripción de este vídeo (ni subtítulos ni procesamiento del audio). Solo se dispone del título y del canal. NO inventes ni supongas el contenido del vídeo: limita el análisis a lo que se deduce del título y del canal, declara que la evidencia es insuficiente y no incluyas críticas ni fuentes sobre afirmaciones que no consten.\n`;
+                textIsFallback = true; // nunca se congela un análisis sin texto real
+                transcriptInfo = { source: "none", generatedBy: "pagina", complete: false, note: "No se pudo obtener la transcripción: el análisis solo se basa en el título y el canal." };
               }
               ytContext += `--- FIN DEL RECURSO DE YOUTUBE ---`;
 
@@ -816,6 +883,20 @@ async function startServer() {
             } catch (ytErr) {
               console.warn("YouTube handler error, falling back to generic fetch:", ytErr);
             }
+          }
+
+          // URL directa a un archivo de audio (.mp3, .m4a…): se transcribe sin pasar por el scraper HTML
+          if (!scraped && isDirectAudioUrl(url)) {
+            effectiveContentType = "podcast";
+            let fileName = "Audio";
+            try { fileName = decodeURIComponent(new URL(url).pathname.split("/").pop() || "Audio"); } catch { /* nombre por defecto */ }
+            title = fileName;
+            const pod = await podcastTranscript([url], fileName);
+            if (!pod.ok) throw new Error(`No se pudo transcribir el audio: ${pod.error}`);
+            transcript = pod.text;
+            transcriptInfo = pod.info;
+            textToAnalyze = `--- TRANSCRIPCIÓN AUTOMÁTICA DEL AUDIO "${fileName}" (IA; con marcas de tiempo [MM:SS]) ---\n${pod.text}\n--- FIN DE LA TRANSCRIPCIÓN ---`;
+            scraped = true;
           }
 
           // Special handler for Substack URLs (e.g. https://elarjonauta.substack.com/p/la-ia-china-o-el-arte-de-no-ser-gobernados?r=5h3vek)
@@ -877,7 +958,7 @@ async function startServer() {
             title = ogTitle || pageTitle || "Contenido de Internet";
 
             // Clean up page noise
-            $("script, style, header, footer, nav, iframe, noscript, svg, .subscription-widget-wrap, .comments-section").remove();
+            $("script, style, header, footer, nav, iframe, noscript, svg, .subscription-widget-wrap, .comments-section, #comments, .comments-area, .comment-list, #respond, .comment-respond").remove();
 
             // Extract content from Substack / blogs / articles
             let bodyText = "";
@@ -905,6 +986,23 @@ async function startServer() {
             }
 
             textToAnalyze = bodyText.substring(0, 45000);
+
+            // Podcast: si la página trae un archivo de audio y su texto es solo la ficha del episodio,
+            // el contenido real está en el audio, no en las notas.
+            const audioCandidates = process.env.AUTO_TRANSCRIBE === "false" ? [] : findAudioCandidates(html, response.finalUrl);
+            if (audioCandidates.length > 0 && (contentType === "podcast" || bodyText.length < 6000)) {
+              effectiveContentType = "podcast";
+              const notes = textToAnalyze;
+              const pod = await podcastTranscript(audioCandidates, title);
+              if (pod.ok) {
+                transcript = pod.text;
+                transcriptInfo = pod.info;
+                textToAnalyze = `--- NOTAS DEL EPISODIO (texto de la página web) ---\n${notes}\n--- FIN DE LAS NOTAS ---\n\n--- TRANSCRIPCIÓN AUTOMÁTICA DEL AUDIO (IA; con marcas de tiempo [MM:SS]) ---\n${pod.text}\n--- FIN DE LA TRANSCRIPCIÓN ---`;
+              } else {
+                console.warn("Podcast: no se pudo transcribir el audio, se analizan solo las notas:", pod.error);
+                transcriptInfo = { source: "show-notes", generatedBy: "pagina", complete: false, note: `No se pudo transcribir el audio: ${pod.error}`.slice(0, 500) };
+              }
+            }
           }
         } catch (scrapeErr: any) {
           if (scrapeErr instanceof UnsafeUrlError) throw scrapeErr; // p. ej. redirección a IP privada → 400
@@ -913,6 +1011,8 @@ async function startServer() {
           textIsFallback = true;
         }
       }
+
+      if (textToAnalyze.length > MAX_MEDIA_TEXT_CHARS) textToAnalyze = textToAnalyze.substring(0, MAX_MEDIA_TEXT_CHARS);
 
       if (contentParts.length === 0 && (!textToAnalyze || textToAnalyze.trim().length < 10)) {
         return res.status(400).json({ error: "No se pudo extraer suficiente contenido, documento o imagen para analizar." });
@@ -1044,7 +1144,7 @@ Instrucciones detalladas de análisis:
 `;
 
       let userPrompt = "";
-      if (imageList.length > 0) {
+      if (imageList.length > 0 && !ocrApplied) {
         userPrompt = `
 Has recibido ${imageList.length} fotografía(s) de un artículo de prensa, periódico, revista o documento impreso.
 Lee y transcribe minuciosamente el texto impreso, las cabeceras, subtítulos, pies de foto y los datos estadísticos visibles en la(s) foto(s).
@@ -1060,6 +1160,8 @@ Tipo de contenido: "${contentType || "blog"}"
 Texto extraído o referencia:
 ${textToAnalyze}
 `;
+        const mediaNote = mediaNoteFor(transcriptInfo);
+        if (mediaNote) userPrompt += `\n${mediaNote}\n`;
       }
 
       // Notas de contexto curadas: solo se activan si el texto trata ese asunto; la comprobación de "qué reconoce el texto" es determinista
@@ -1370,6 +1472,8 @@ ${textToAnalyze}
         categories: result.categories || [],
         translation: result.translation || undefined,
         originalExtractedText: textToAnalyze || undefined,
+        transcript: transcript || undefined,
+        transcriptInfo: transcript || transcriptInfo ? transcriptInfo : undefined,
         executiveSummary: result.executiveSummary || "",
         keyPoints: result.keyPoints || [],
         numericalExamples: result.numericalExamples || [],
@@ -1381,7 +1485,7 @@ ${textToAnalyze}
         scoutAssessment: sanitizeScout(result.scoutAssessment),
         contextNotes: contextNotes.length ? contextNotes : undefined,
         analyzedAt: new Date().toISOString(),
-        contentType: isDoc ? "document" : (isPhoto ? "photo" : (contentType || "blog")),
+        contentType: (isDoc ? "document" : (isPhoto ? "photo" : (effectiveContentType || "blog"))) as AnalysisResult["contentType"],
         photoUrls: imageList.length > 0 ? imageList : undefined,
         fileNames: documentNames.length > 0 ? documentNames : undefined,
         overallReliabilityScore: overallReliabilityScore
@@ -1437,7 +1541,7 @@ ${textToAnalyze}
           if (response.ok) {
             const html = await response.text();
             const $ = cheerio.load(html);
-            $("script, style, header, footer, nav, iframe, noscript, svg, .subscription-widget-wrap, .comments-section").remove();
+            $("script, style, header, footer, nav, iframe, noscript, svg, .subscription-widget-wrap, .comments-section, #comments, .comments-area, .comment-list, #respond, .comment-respond").remove();
             targetText = $("article").text().trim() || $("main").text().trim() || $("body").text().trim();
             targetText = targetText.substring(0, 50000);
           }

@@ -1,0 +1,1120 @@
+diff -ruN a/.env.example b/.env.example
+--- a/.env.example	2026-10-29 21:43:21.214688267 +0000
++++ b/.env.example	2026-10-29 21:43:21.216819444 +0000
+@@ -36,3 +36,10 @@
+ # Secreto con el que se firma la parte auditada (fuentes y críticas) para poder reutilizarla. Si no lo defines, se deriva de GEMINI_API_KEY.
+ # Si lo cambias, los análisis anteriores dejan de reutilizarse.
+ # CACHE_SECRET=
++
++# ── Podcasts, vídeos y fotos (transcripción) ─────────────────────────────────
++# Todo es opcional; los valores por defecto ya funcionan.
++# MAX_AUDIO_MB=120            # tope de descarga de un episodio (≈ 2 h en MP3 a 128 kbps). Se descarga al disco temporal, no a memoria.
++# AUTO_TRANSCRIBE=false       # desactiva la transcripción automática del audio de una página; los podcasts vuelven a analizarse solo por sus notas
++# YOUTUBE_AI_TRANSCRIPT=false # si un vídeo no tiene subtítulos, NO se pide a Gemini que lo transcriba
++# OCR_PREPASS=false           # las fotos vuelven a enviarse directamente al análisis, sin paso OCR previo
+diff -ruN a/server/media.ts b/server/media.ts
+--- a/server/media.ts	1970-01-01 00:00:00.000000000 +0000
++++ b/server/media.ts	2026-10-29 21:43:21.223043711 +0000
+@@ -0,0 +1,431 @@
++// Podcasts, vídeos y fotos · de "lo que dice la página" a "lo que dice el contenido".
++// Hasta ahora, una URL de podcast se analizaba por sus notas web (unas pocas líneas) y un vídeo de YouTube
++// sin subtítulos se trataba como "tutorial mudo". Este módulo obtiene el contenido real:
++//   · audio  → se localiza el archivo en la página, se descarga (anti-SSRF) y se transcribe con Gemini
++//   · YouTube → subtítulos si existen; si no, Gemini procesa el vídeo público directamente
++//   · fotos  → paso OCR dedicado (texto literal) antes del análisis, para que se pueda revisar y auditar
++// Toda transcripción lleva TranscriptInfo: quién la generó, si está completa y de qué fuente viene.
++import crypto from "node:crypto";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import * as cheerio from "cheerio";
++import { FileState, createPartFromUri, type GoogleGenAI } from "@google/genai";
++import { safeDownload } from "./safeFetch";
++
++export type TranscriptSource = "audio" | "youtube-captions" | "youtube-video" | "ocr" | "show-notes" | "none";
++
++export interface TranscriptInfo {
++  source: TranscriptSource;
++  /** ia = generada por un modelo; subtitulos = subtítulos de YouTube; pagina = solo texto de la página. */
++  generatedBy: "ia" | "subtitulos" | "pagina";
++  /** true solo si el modelo confirmó el final del audio/vídeo. */
++  complete: boolean;
++  model?: string;
++  passes?: number;
++  audioUrl?: string;
++  note?: string;
++}
++
++export interface MediaDeps {
++  ai: GoogleGenAI;
++  models: string[];
++}
++
++export interface TranscriptResult {
++  text: string;
++  complete: boolean;
++  passes: number;
++  model: string;
++  note?: string;
++}
++
++export const END_MARKER = "[FIN DE LA TRANSCRIPCIÓN]";
++const MAX_PASSES = 6;
++export const MIN_AUDIO_BYTES = 200 * 1024; // por debajo es un efecto de sonido de la plantilla, no un episodio
++export const MAX_AUDIO_BYTES = (Number(process.env.MAX_AUDIO_MB) || 120) * 1024 * 1024;
++
++// ───────────────────────── Localizar el audio en una página ─────────────────────────
++
++const AUDIO_EXT_RE = /\.(?:mp3|m4a|aac|oga|ogg|opus|wav|flac)$/i;
++const RAW_AUDIO_URL_RE = /https?:\/\/[^\s"'<>()\\]+?\.(?:mp3|m4a|aac|oga|ogg|opus|wav|flac)(?:\?[^\s"'<>()\\]*)?/gi;
++const DOWNLOAD_PATH_RE = /\/(?:podcast-download|download)\//i;
++
++/** true si la ruta de la URL termina en una extensión de audio (ignora query y hash). */
++export function isDirectAudioUrl(raw: string): boolean {
++  try {
++    return AUDIO_EXT_RE.test(new URL(raw).pathname);
++  } catch {
++    return false;
++  }
++}
++
++function collectContentUrls(node: unknown, out: string[], depth = 0): void {
++  if (depth > 6 || node == null) return;
++  if (Array.isArray(node)) {
++    for (const n of node) collectContentUrls(n, out, depth + 1);
++    return;
++  }
++  if (typeof node === "object") {
++    for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
++      if (k === "contentUrl" && typeof v === "string") out.push(v);
++      else collectContentUrls(v, out, depth + 1);
++    }
++  }
++}
++
++/**
++ * Devuelve las URLs candidatas a ser el audio del episodio, ordenadas por fiabilidad:
++ * archivos de audio directos primero, enlaces de descarga con redirección después.
++ * Fuentes: og:audio, <audio>/<source>, JSON-LD (contentUrl), enlaces y, como último recurso, un barrido del HTML.
++ */
++export function findAudioCandidates(html: string, pageUrl: string): string[] {
++  const $ = cheerio.load(html);
++  const ordered: string[] = [];
++  const seen = new Set<string>();
++  const add = (raw?: string | null) => {
++    if (!raw) return;
++    let abs: string;
++    try {
++      abs = new URL(raw.trim().replace(/&amp;/g, "&"), pageUrl).toString();
++    } catch {
++      return;
++    }
++    if (!/^https?:\/\//i.test(abs) || seen.has(abs)) return;
++    seen.add(abs);
++    ordered.push(abs);
++  };
++
++  $(
++    'meta[property="og:audio"], meta[property="og:audio:url"], meta[property="og:audio:secure_url"], meta[name="twitter:player:stream"]'
++  ).each((_, el) => add($(el).attr("content")));
++
++  $("audio[src], audio source[src]").each((_, el) => add($(el).attr("src")));
++
++  $('script[type="application/ld+json"]').each((_, el) => {
++    try {
++      const urls: string[] = [];
++      collectContentUrls(JSON.parse($(el).html() || ""), urls);
++      urls.forEach(add);
++    } catch {
++      /* JSON-LD mal formado: se ignora */
++    }
++  });
++
++  $("a[href]").each((_, el) => {
++    const href = $(el).attr("href") || "";
++    let pathname = "";
++    try {
++      pathname = new URL(href, pageUrl).pathname;
++    } catch {
++      return;
++    }
++    if (AUDIO_EXT_RE.test(pathname) || DOWNLOAD_PATH_RE.test(pathname)) add(href);
++  });
++
++  for (const m of html.matchAll(RAW_AUDIO_URL_RE)) add(m[0]);
++
++  return [...ordered.filter(isDirectAudioUrl), ...ordered.filter((u) => !isDirectAudioUrl(u))];
++}
++
++/** Tipos MIME a probar para un archivo, del más probable al menos. Gemini documenta mp3/aac/ogg/wav/flac/aiff; m4a no figura en todas las tablas, de ahí la lista de alternativas. */
++export function mimeCandidatesFor(urlOrName: string, contentType = ""): string[] {
++  const ct = contentType.split(";")[0].trim().toLowerCase();
++  let ext = "";
++  try {
++    ext = path.extname(new URL(urlOrName).pathname).toLowerCase();
++  } catch {
++    ext = path.extname(urlOrName).toLowerCase();
++  }
++  const byExt: Record<string, string[]> = {
++    ".mp3": ["audio/mp3", "audio/mpeg"],
++    ".m4a": ["audio/m4a", "audio/mp4", "audio/aac"],
++    ".aac": ["audio/aac"],
++    ".ogg": ["audio/ogg"],
++    ".oga": ["audio/ogg"],
++    ".opus": ["audio/opus", "audio/ogg"],
++    ".wav": ["audio/wav"],
++    ".flac": ["audio/flac"],
++  };
++  const list = [...(byExt[ext] || [])];
++  if (ct.startsWith("audio/") && !list.includes(ct)) list.push(ct);
++  if (list.length === 0) list.push("audio/mpeg", "audio/mp3", "audio/mp4");
++  return list;
++}
++
++// ───────────────────────── Descarga ─────────────────────────
++
++export interface DownloadedAudio {
++  filePath: string;
++  dir: string;
++  bytes: number;
++  url: string;
++  mimeCandidates: string[];
++  cleanup: () => void;
++}
++
++/** Prueba hasta `maxTries` candidatos y se queda con el primero que sea un audio de tamaño razonable. */
++export async function downloadFirstAudio(
++  candidates: string[],
++  opts: { maxBytes?: number; maxTries?: number } = {}
++): Promise<{ audio: DownloadedAudio | null; errors: string[] }> {
++  const { maxBytes = MAX_AUDIO_BYTES, maxTries = 3 } = opts;
++  const errors: string[] = [];
++  for (const url of candidates.slice(0, maxTries)) {
++    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "lupa-audio-"));
++    const filePath = path.join(dir, `audio-${crypto.randomBytes(4).toString("hex")}`);
++    const cleanup = () => fs.rmSync(dir, { recursive: true, force: true });
++    try {
++      const r = await safeDownload(url, filePath, {
++        maxBytes,
++        headers: { "User-Agent": "Mozilla/5.0 (compatible; LupaCritica/1.0)", Accept: "audio/*,*/*;q=0.8" },
++      });
++      const ct = r.contentType.toLowerCase();
++      if (ct.startsWith("text/") || ct.includes("json") || ct.includes("html")) {
++        throw new Error("El enlace devuelve una página, no un audio.");
++      }
++      if (r.bytes < MIN_AUDIO_BYTES) throw new Error("El archivo es demasiado pequeño para ser un episodio.");
++      return {
++        audio: { filePath, dir, bytes: r.bytes, url: r.finalUrl, mimeCandidates: mimeCandidatesFor(r.finalUrl, r.contentType), cleanup },
++        errors,
++      };
++    } catch (e: any) {
++      cleanup();
++      errors.push(`${url}: ${e?.message || e}`);
++    }
++  }
++  return { audio: null, errors };
++}
++
++// ───────────────────────── Llamadas a Gemini ─────────────────────────
++
++const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
++const isTransient = (m: string) => /429|RESOURCE_EXHAUSTED|503|UNAVAILABLE|high demand|rate-limits|quota|timeout|ECONNRESET|fetch failed/i.test(m);
++const isBadMime = (m: string) => /INVALID_ARGUMENT|mime|unsupported|not supported|format/i.test(m) && !isTransient(m);
++
++async function generateWithFallback(
++  deps: MediaDeps,
++  contents: any,
++  config: Record<string, any>,
++  label: string
++): Promise<{ text: string; finishReason: string; model: string }> {
++  let lastErr: any = null;
++  for (const model of deps.models) {
++    for (let attempt = 1; attempt <= 2; attempt++) {
++      try {
++        const response = await deps.ai.models.generateContent({ model, contents, config });
++        const text = (response.text || "").trim();
++        const finishReason = String(response.candidates?.[0]?.finishReason || "");
++        if (text || finishReason === "STOP") return { text, finishReason, model };
++        lastErr = new Error(`${label}: respuesta vacía (${finishReason || "sin motivo"})`);
++        break;
++      } catch (e: any) {
++        lastErr = e;
++        const msg = String(e?.message || e);
++        console.warn(`[Media ${label}] ${model} intento ${attempt}: ${msg.slice(0, 300)}`);
++        if (isBadMime(msg)) throw e; // no se arregla cambiando de modelo
++        if (isTransient(msg) && attempt === 1) {
++          await sleep(2500 + Math.random() * 1500);
++          continue;
++        }
++        break;
++      }
++    }
++  }
++  throw lastErr || new Error(`${label}: no se obtuvo respuesta de ningún modelo.`);
++}
++
++function norm(s: string): string {
++  return s.replace(/\s+/g, " ").trim().toLowerCase();
++}
++
++/** Bucle común de transcripción: pide el texto y, si el modelo se corta o no confirma el final, continúa donde lo dejó. */
++async function transcribeLoop(
++  deps: MediaDeps,
++  mediaPart: any,
++  firstPrompt: string,
++  label: string
++): Promise<TranscriptResult> {
++  let acc = "";
++  let complete = false;
++  let passes = 0;
++  let model = deps.models[0];
++  let note: string | undefined;
++
++  for (let pass = 1; pass <= MAX_PASSES; pass++) {
++    passes = pass;
++    const prompt =
++      pass === 1
++        ? firstPrompt
++        : `Continúa la transcripción exactamente donde terminó. Lo último transcrito fue:\n"""\n${acc.slice(-500)}\n"""\n` +
++          `Sigue con la frase siguiente del audio, sin repetir nada de lo anterior, con el mismo formato y marcas de tiempo. ` +
++          `Si ya no queda nada por transcribir, responde únicamente: ${END_MARKER}`;
++
++    const r = await generateWithFallback(
++      deps,
++      [{ role: "user", parts: [mediaPart, { text: prompt }] }],
++      { temperature: 0 },
++      `${label} pasada ${pass}`
++    );
++    model = r.model;
++    let chunk = r.text;
++    const hasEnd = chunk.includes(END_MARKER);
++    chunk = chunk.replace(END_MARKER, "").trim();
++
++    // Anti-bucle: si el modelo repite lo que ya había, se corta aquí.
++    if (pass > 1 && chunk.length > 80 && norm(acc).includes(norm(chunk).slice(0, 160))) {
++      note = "El modelo empezó a repetirse; la transcripción se ha cortado en ese punto.";
++      break;
++    }
++    if (chunk) acc += (acc ? "\n\n" : "") + chunk;
++    if (hasEnd) {
++      complete = true;
++      break;
++    }
++    if (!chunk) break; // sin más texto y sin marca de fin: no se puede confirmar
++  }
++
++  if (!complete && !note) note = "El modelo no confirmó el final del contenido; puede faltar la parte final.";
++  return { text: acc.trim(), complete, passes, model, note };
++}
++
++async function waitUntilActive(ai: GoogleGenAI, name: string, timeoutMs = 180_000): Promise<any> {
++  const t0 = Date.now();
++  for (;;) {
++    const f: any = await ai.files.get({ name });
++    if (f.state === FileState.ACTIVE) return f;
++    if (f.state === FileState.FAILED) throw new Error("Gemini no pudo procesar el archivo de audio.");
++    if (Date.now() - t0 > timeoutMs) throw new Error("Tiempo agotado esperando a que Gemini procese el audio.");
++    await sleep(2500);
++  }
++}
++
++function audioPrompt(ctx: { title?: string }): string {
++  return `Transcribe este audio de forma íntegra y literal, de principio a fin.
++Reglas:
++- Conserva el idioma original: no traduzcas, no resumas, no parafrasees, no corrijas el contenido y no añadas comentarios tuyos.
++- Cada intervención o párrafo empieza con una marca de tiempo [MM:SS] (o [H:MM:SS] pasada la primera hora). Si hay más de una voz, añade una etiqueta "Voz 1:", "Voz 2:"… Usa un nombre propio solo si se dice expresamente en el audio.
++- Escribe con puntuación y párrafos normales. Respeta cifras, nombres propios y citas tal y como se dicen.
++- Si algo no se entiende, escribe [inaudible]. Si dudas de una palabra, escríbela seguida de [?].
++- Música, sintonías y publicidad: indícalo en una línea entre corchetes ([música], [publicidad]) sin transcribir letras cantadas.
++- No inventes nada que no se oiga. Si el audio termina, termina la transcripción.
++- Cuando acabes el audio, escribe en una última línea exactamente: ${END_MARKER}
++${ctx.title ? `\nTítulo del episodio (solo como ayuda ortográfica para nombres propios; no es contenido): "${ctx.title}"\n` : ""}
++Devuelve únicamente la transcripción.`;
++}
++
++/** Sube un archivo de audio local a la Files API de Gemini y lo transcribe. Prueba varios MIME si el primero se rechaza. */
++export async function transcribeAudioFile(
++  deps: MediaDeps,
++  filePath: string,
++  mimeCandidates: string[],
++  ctx: { title?: string } = {}
++): Promise<TranscriptResult> {
++  let lastErr: any = null;
++  for (const mimeType of mimeCandidates) {
++    let uploadedName: string | undefined;
++    try {
++      const up: any = await deps.ai.files.upload({ file: filePath, config: { mimeType } });
++      uploadedName = up.name;
++      const active = await waitUntilActive(deps.ai, up.name);
++      const part = createPartFromUri(active.uri, active.mimeType || mimeType);
++      return await transcribeLoop(deps, part, audioPrompt(ctx), "audio");
++    } catch (e: any) {
++      lastErr = e;
++      const msg = String(e?.message || e);
++      console.warn(`[Media audio] MIME ${mimeType} falló: ${msg.slice(0, 300)}`);
++      if (!isBadMime(msg)) throw e;
++    } finally {
++      if (uploadedName) deps.ai.files.delete({ name: uploadedName }).catch(() => undefined); // caduca solo a las 48 h; se borra antes por limpieza
++    }
++  }
++  throw lastErr || new Error("Gemini no aceptó ningún formato para este audio.");
++}
++
++/** Transcribe un vídeo público de YouTube pasándoselo a Gemini por URL (no se descarga nada). */
++export async function transcribeYouTubeVideo(deps: MediaDeps, url: string, ctx: { title?: string } = {}): Promise<TranscriptResult> {
++  const prompt = `Transcribe lo que se dice en este vídeo, de principio a fin y de forma literal.
++Reglas:
++- Conserva el idioma original: no traduzcas ni resumas ni añadas comentarios tuyos.
++- Cada intervención o párrafo empieza con una marca de tiempo [MM:SS] (o [H:MM:SS]). Si hay varias voces, etiqueta "Voz 1:", "Voz 2:"… y usa un nombre solo si se dice o aparece escrito en pantalla.
++- Si en un tramo no hay voz (música, demostración, tutorial mudo), descríbelo en una línea entre corchetes con las acciones o instrucciones visibles y el texto en pantalla relevante, p. ej. [en pantalla: …]. No inventes lo que no se vea ni se oiga.
++- Si algo no se entiende, escribe [inaudible]. Si dudas de una palabra, escríbela seguida de [?].
++- Cuando acabes el vídeo, escribe en una última línea exactamente: ${END_MARKER}
++${ctx.title ? `\nTítulo (solo ayuda ortográfica): "${ctx.title}"\n` : ""}
++Devuelve únicamente la transcripción.`;
++  return transcribeLoop(deps, { fileData: { fileUri: url } }, prompt, "youtube");
++}
++
++export interface PodcastResult {
++  ok: boolean;
++  text?: string;
++  info?: TranscriptInfo;
++  error?: string;
++}
++
++/** Orquesta: descarga el primer audio válido, lo transcribe y limpia el temporal. Nunca lanza: devuelve ok:false con el motivo. */
++export async function transcribePodcast(deps: MediaDeps, candidates: string[], ctx: { title?: string } = {}): Promise<PodcastResult> {
++  if (candidates.length === 0) return { ok: false, error: "No se encontró ningún archivo de audio en la página." };
++  const { audio, errors } = await downloadFirstAudio(candidates);
++  if (!audio) return { ok: false, error: `No se pudo descargar el audio. ${errors.slice(0, 2).join(" | ")}`.slice(0, 600) };
++  try {
++    const r = await transcribeAudioFile(deps, audio.filePath, audio.mimeCandidates, ctx);
++    if (r.text.length < 100) return { ok: false, error: "La transcripción devuelta está vacía o es demasiado corta." };
++    return {
++      ok: true,
++      text: r.text,
++      info: { source: "audio", generatedBy: "ia", complete: r.complete, model: r.model, passes: r.passes, audioUrl: audio.url, note: r.note },
++    };
++  } catch (e: any) {
++    return { ok: false, error: `Falló la transcripción: ${String(e?.message || e).slice(0, 400)}` };
++  } finally {
++    audio.cleanup();
++  }
++}
++
++// ───────────────────────── Fotos (OCR dedicado) ─────────────────────────
++
++export interface ImageInput {
++  mimeType: string;
++  data: string; // base64 sin cabecera
++}
++
++/** Transcribe el texto impreso de una o varias fotos. Texto literal, con marcas de duda; no resume ni traduce. */
++export async function transcribeImages(deps: MediaDeps, images: ImageInput[]): Promise<{ text: string; model: string }> {
++  if (images.length === 0) return { text: "", model: deps.models[0] };
++  const prompt = `Transcribe fielmente el texto impreso visible en ${images.length === 1 ? "esta imagen" : "estas imágenes"} (recortes de prensa, revistas, páginas de libro o documentos).
++- Respeta el orden de lectura: titular, antetítulo, subtítulo, firma, cuerpo (columna por columna, de izquierda a derecha), pies de foto, recuadros y datos de infografías.
++- Transcribe literalmente, incluidas cifras, nombres propios y comillas. No resumas, no traduzcas, no corrijas y no completes lo que no se vea.
++- Si una palabra o cifra no se lee con seguridad, escribe [ilegible], o tu mejor lectura seguida de [?].
++- Si hay varias imágenes, sepáralas con una línea "--- Imagen N ---" en el orden recibido.
++- Los elementos no textuales relevantes (gráficos, fotos) se indican en una línea breve entre corchetes, p. ej. [gráfico: barras de gasto por año].
++Devuelve únicamente la transcripción.`;
++  const parts = [...images.map((i) => ({ inlineData: { mimeType: i.mimeType, data: i.data } })), { text: prompt }];
++  const r = await generateWithFallback(deps, [{ role: "user", parts }], { temperature: 0 }, "ocr");
++  return { text: r.text, model: r.model };
++}
++
++// ───────────────────────── Aviso al modelo según el origen del texto ─────────────────────────
++
++const NO_COPY_RULE =
++  "La transcripción ya se muestra aparte en la app: NO la copies en 'translation' (déjalo vacío si el idioma es castellano, gallego o catalán; si está en otro idioma, 'translation' contendrá su traducción).";
++
++/** Frase que se añade al prompt de análisis para que el modelo sepa de dónde sale el texto y cuánto fiarse de él. */
++export function mediaNoteFor(info: TranscriptInfo | undefined): string {
++  if (!info) return "";
++  const incompleta = info.complete ? "" : " ATENCIÓN: la transcripción está INCOMPLETA; no concluyas nada sobre lo que no consta en ella.";
++  switch (info.source) {
++    case "audio":
++      return `Nota: el texto incluye (1) las notas de la página del episodio y (2) una transcripción automática del audio generada por IA, con marcas de tiempo [MM:SS]. Puede contener errores de reconocimiento (nombres propios, cifras): si una crítica depende de una cifra o un nombre dudoso, dilo. Distingue lo que dice el episodio de lo que dicen las notas de la web. ${NO_COPY_RULE}${incompleta}`;
++    case "youtube-video":
++      return `Nota: el texto es una transcripción automática del vídeo generada por IA, con marcas de tiempo [MM:SS] y descripciones de lo visible entre corchetes. Puede contener errores de reconocimiento. ${NO_COPY_RULE}${incompleta}`;
++    case "youtube-captions":
++      return `Nota: el texto son los subtítulos de YouTube (pueden ser automáticos, sin puntuación y con errores en nombres propios y cifras). ${NO_COPY_RULE}${incompleta}`;
++    case "ocr":
++      return "Nota: el texto procede de una transcripción OCR automática de fotografías y puede contener errores de lectura. No atribuyas al autor erratas evidentes ni cifras dudosas (marcadas con [?] o [ilegible]).";
++    case "show-notes":
++      return "Nota: solo se dispone de las notas de la página del episodio; NO se ha podido acceder al audio. No atribuyas al episodio contenido que no consta en las notas, limita el análisis a ellas y concluye 'insuficiente' en la suficiencia de la evidencia cuando proceda.";
++    default:
++      return "";
++  }
++}
+diff -ruN a/server/safeFetch.ts b/server/safeFetch.ts
+--- a/server/safeFetch.ts	2026-10-29 21:43:21.204093559 +0000
++++ b/server/safeFetch.ts	2026-10-29 21:43:21.206586456 +0000
+@@ -2,7 +2,10 @@
+ // Defensa en capas: (1) validación sintáctica, (2) validación de la IP en el MOMENTO de conectar
+ // (cierra DNS-rebinding), (3) redirecciones manuales revalidadas, (4) timeout y tope de bytes.
+ import dns from "node:dns";
++import fs from "node:fs";
+ import net from "node:net";
++import { Readable, Transform } from "node:stream";
++import { pipeline } from "node:stream/promises";
+ import { Agent, fetch as undiciFetch } from "undici";
+ 
+ export class UnsafeUrlError extends Error {
+@@ -179,3 +182,75 @@
+   }
+   throw new UnsafeUrlError("Demasiadas redirecciones.");
+ }
++
++export interface SafeDownloadOptions {
++  headers?: Record<string, string>;
++  timeoutMs?: number;
++  maxBytes?: number;
++  maxRedirects?: number;
++}
++
++export interface SafeDownloadResult {
++  bytes: number;
++  contentType: string;
++  finalUrl: string;
++}
++
++/**
++ * Descarga binaria (audio) a disco con las mismas defensas anti-SSRF que safeFetch:
++ * validación de URL, IP comprobada al conectar, redirecciones revalidadas y tope de bytes.
++ * Escribe en streaming (no carga el archivo en memoria). Si se supera el tope, borra el parcial y lanza error.
++ */
++export async function safeDownload(rawUrl: string, destPath: string, opts: SafeDownloadOptions = {}): Promise<SafeDownloadResult> {
++  const { headers = {}, timeoutMs = 240_000, maxBytes = 120 * 1024 * 1024, maxRedirects = 5 } = opts;
++  let current = parseAndValidateUrl(rawUrl);
++
++  for (let hop = 0; hop <= maxRedirects; hop++) {
++    const res = await undiciFetch(current.toString(), {
++      method: "GET",
++      headers,
++      redirect: "manual",
++      dispatcher: agent,
++      signal: AbortSignal.timeout(timeoutMs),
++    }).catch((e: any) => {
++      if (e?.cause instanceof UnsafeUrlError) throw e.cause;
++      throw e;
++    });
++
++    if (res.status >= 300 && res.status < 400 && res.headers.get("location")) {
++      await res.body?.cancel();
++      current = parseAndValidateUrl(new URL(res.headers.get("location")!, current).toString());
++      continue;
++    }
++
++    if (res.status < 200 || res.status >= 300) {
++      await res.body?.cancel();
++      throw new Error(`Error al descargar el archivo (${res.status} ${res.statusText}).`);
++    }
++
++    const limitMb = Math.round(maxBytes / 1024 / 1024);
++    const declared = Number(res.headers.get("content-length") || 0);
++    if (declared > maxBytes) {
++      await res.body?.cancel();
++      throw new Error(`El archivo (${Math.round(declared / 1024 / 1024)} MB) supera el límite de ${limitMb} MB.`);
++    }
++    if (!res.body) throw new Error("La respuesta no trae contenido.");
++
++    let total = 0;
++    const limiter = new Transform({
++      transform(chunk, _enc, cb) {
++        total += chunk.length;
++        if (total > maxBytes) cb(new Error(`El archivo supera el límite de ${limitMb} MB.`));
++        else cb(null, chunk);
++      },
++    });
++    try {
++      await pipeline(Readable.fromWeb(res.body as any), limiter, fs.createWriteStream(destPath));
++    } catch (e) {
++      fs.rmSync(destPath, { force: true });
++      throw e;
++    }
++    return { bytes: total, contentType: res.headers.get("content-type") || "", finalUrl: current.toString() };
++  }
++  throw new UnsafeUrlError("Demasiadas redirecciones.");
++}
+diff -ruN a/server.ts b/server.ts
+--- a/server.ts	2026-10-29 21:43:21.181833894 +0000
++++ b/server.ts	2026-10-29 21:43:21.184560961 +0000
+@@ -20,6 +20,10 @@
+ import nodeCrypto from "node:crypto";
+ import { PIPELINE_BASE_VERSION, MIN_FREEZE_CHARS, contentHash, seedFromHash, signAnalysis, findReusable, type FrozenInfo } from "./server/stability";
+ import { runClaimAudit, rewriteWithCorrections, parseGeminiError, type AuditDeps, type ClaimCheck, type ClaimVerdict } from "./server/audit";
++import {
++  findAudioCandidates, isDirectAudioUrl, transcribePodcast, transcribeYouTubeVideo, transcribeImages, mediaNoteFor,
++  type TranscriptInfo, type MediaDeps,
++} from "./server/media";
+ 
+ // Load environment variables
+ dotenv.config();
+@@ -41,6 +45,10 @@
+     }
+   }
+ });
++// Modelos para transcribir audio/vídeo y hacer OCR (mismo orden de respaldo que el resto del pipeline)
++const mediaDeps: MediaDeps = { ai, models: ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"] };
++// Tope de caracteres del texto que se envía a analizar (una transcripción de ~2 h cabe de sobra)
++const MAX_MEDIA_TEXT_CHARS = 400_000;
+ 
+ export interface VerifiedScholarlyCitation {
+   title: string;
+@@ -171,6 +179,9 @@
+   categories: string[];
+   translation?: string;
+   originalExtractedText?: string;
++  /** Transcripción del audio/vídeo (con marcas de tiempo) o texto OCR de las fotos. Distinta de `translation`. */
++  transcript?: string;
++  transcriptInfo?: TranscriptInfo;
+   executiveSummary: string;
+   keyPoints: string[];
+   numericalExamples?: NumericalExample[];
+@@ -659,6 +670,9 @@
+       let textToAnalyze = manualText || "";
+       let textIsFallback = false; // true si el scraping falló y solo se tiene la URL: NUNCA se congela un análisis sin texto real
+       let finalUrl = url || "";
++      let transcript: string | undefined; // transcripción de audio/vídeo u OCR de fotos (se muestra aparte)
++      let transcriptInfo: TranscriptInfo | undefined;
++      let effectiveContentType: string | undefined = contentType;
+       const imageList: string[] = [];
+       const documentNames: string[] = [];
+       const contentParts: any[] = [];
+@@ -727,6 +741,29 @@
+         }
+       }
+ 
++      // Fotos: paso OCR dedicado. El texto literal se puede revisar, se audita y permite reutilizar el análisis
++      // (con las imágenes dentro de la llamada de análisis no había texto que congelar ni que auditar).
++      let ocrApplied = false;
++      if (imageList.length > 0 && process.env.OCR_PREPASS !== "false") {
++        try {
++          const imageParts = contentParts
++            .filter((p) => p?.inlineData?.mimeType?.startsWith("image/"))
++            .map((p) => ({ mimeType: p.inlineData.mimeType as string, data: p.inlineData.data as string }));
++          const ocr = await transcribeImages(mediaDeps, imageParts);
++          if (ocr.text.length >= 80) {
++            ocrApplied = true;
++            transcript = ocr.text;
++            transcriptInfo = { source: "ocr", generatedBy: "ia", complete: true, model: ocr.model, note: "Texto leído de la(s) foto(s) por IA; revisa cifras y nombres propios." };
++            extractedDocsText += `\n\n--- TEXTO TRANSCRITO DE LA(S) FOTOGRAFÍA(S) (OCR automático) ---\n${ocr.text}\n--- FIN DEL TEXTO TRANSCRITO ---`;
++            for (let i = contentParts.length - 1; i >= 0; i--) {
++              if (contentParts[i]?.inlineData?.mimeType?.startsWith("image/")) contentParts.splice(i, 1);
++            }
++          }
++        } catch (ocrErr) {
++          console.warn("OCR previo fallido; se analizan las imágenes directamente:", ocrErr);
++        }
++      }
++
+       if (extractedDocsText) {
+         textToAnalyze = (textToAnalyze ? textToAnalyze + "\n\n" : "") + extractedDocsText;
+       }
+@@ -738,6 +775,14 @@
+         title = "Artículo en Fotografía";
+       }
+ 
++      // Reutiliza la transcripción de un análisis anterior de la misma URL: transcribir cuesta minutos y cuota.
++      const podcastTranscript = async (candidates: string[], pageTitle: string) => {
++        const prev = fresh === true ? undefined : Object.values(db).find((a) => a.url === url && a.transcript && a.transcriptInfo?.source === "audio" && a.transcriptInfo.complete);
++        if (prev?.transcript && prev.transcriptInfo) return { ok: true as const, text: prev.transcript, info: prev.transcriptInfo };
++        const r = await transcribePodcast(mediaDeps, candidates, { title: pageTitle });
++        return r.ok ? { ok: true as const, text: r.text!, info: r.info! } : { ok: false as const, error: r.error || "motivo desconocido" };
++      };
++
+       // If a URL was provided, attempt to fetch and scrape the page
+       if (url) {
+         try {
+@@ -797,6 +842,26 @@
+                 }
+               }
+ 
++              // Subtítulos ausentes o mínimos (frecuente en servidores cloud): Gemini procesa el vídeo público por URL.
++              if (transcriptText.length >= 400) {
++                transcriptInfo = { source: "youtube-captions", generatedBy: "subtitulos", complete: true, note: "Subtítulos de YouTube: pueden ser automáticos y sin puntuación." };
++              } else if (process.env.YOUTUBE_AI_TRANSCRIPT !== "false") {
++                try {
++                  const yt = await transcribeYouTubeVideo(mediaDeps, videoId ? `https://www.youtube.com/watch?v=${videoId}` : url, { title: videoTitle || title });
++                  if (yt.text.length >= 200) {
++                    transcriptText = yt.text;
++                    transcriptInfo = { source: "youtube-video", generatedBy: "ia", complete: yt.complete, model: yt.model, passes: yt.passes, note: yt.note };
++                  }
++                } catch (ytAiErr: any) {
++                  console.warn("Transcripción IA del vídeo de YouTube no disponible:", String(ytAiErr?.message || ytAiErr).slice(0, 300));
++                }
++              }
++              if (transcriptText && !transcriptInfo) {
++                transcriptInfo = { source: "youtube-captions", generatedBy: "subtitulos", complete: false, note: "Subtítulos muy breves: puede faltar contenido." };
++              }
++              if (transcriptText) transcript = transcriptText;
++              effectiveContentType = "youtube";
++
+               // 3. Build rich context for Gemini
+               let ytContext = `--- RECURSO MULTIMEDIA DE YOUTUBE ---\n`;
+               ytContext += `Título Oficial del Vídeo: "${videoTitle || title}"\n`;
+@@ -807,7 +872,9 @@
+               if (transcriptText) {
+                 ytContext += `\nTranscripción completa del audio / subtítulos del vídeo:\n${transcriptText}\n`;
+               } else {
+-                ytContext += `\nNota: Este vídeo es un recurso audiovisual/tutorial/demostración (sin subtítulos hablados o con música/instrucción visual directa). El análisis DEBE centrarse con total precisión en el tema de ESTE VÍDEO ("${videoTitle || title}" del canal "${channelName || 'el autor'}") y sus técnicas, metodología, conceptos y disciplina correspondiente.\n`;
++                ytContext += `\nAVISO: no se ha podido obtener la transcripción de este vídeo (ni subtítulos ni procesamiento del audio). Solo se dispone del título y del canal. NO inventes ni supongas el contenido del vídeo: limita el análisis a lo que se deduce del título y del canal, declara que la evidencia es insuficiente y no incluyas críticas ni fuentes sobre afirmaciones que no consten.\n`;
++                textIsFallback = true; // nunca se congela un análisis sin texto real
++                transcriptInfo = { source: "none", generatedBy: "pagina", complete: false, note: "No se pudo obtener la transcripción: el análisis solo se basa en el título y el canal." };
+               }
+               ytContext += `--- FIN DEL RECURSO DE YOUTUBE ---`;
+ 
+@@ -818,6 +885,20 @@
+             }
+           }
+ 
++          // URL directa a un archivo de audio (.mp3, .m4a…): se transcribe sin pasar por el scraper HTML
++          if (!scraped && isDirectAudioUrl(url)) {
++            effectiveContentType = "podcast";
++            let fileName = "Audio";
++            try { fileName = decodeURIComponent(new URL(url).pathname.split("/").pop() || "Audio"); } catch { /* nombre por defecto */ }
++            title = fileName;
++            const pod = await podcastTranscript([url], fileName);
++            if (!pod.ok) throw new Error(`No se pudo transcribir el audio: ${pod.error}`);
++            transcript = pod.text;
++            transcriptInfo = pod.info;
++            textToAnalyze = `--- TRANSCRIPCIÓN AUTOMÁTICA DEL AUDIO "${fileName}" (IA; con marcas de tiempo [MM:SS]) ---\n${pod.text}\n--- FIN DE LA TRANSCRIPCIÓN ---`;
++            scraped = true;
++          }
++
+           // Special handler for Substack URLs (e.g. https://elarjonauta.substack.com/p/la-ia-china-o-el-arte-de-no-ser-gobernados?r=5h3vek)
+           if (!scraped && url.includes("substack.com/p/")) {
+             try {
+@@ -877,7 +958,7 @@
+             title = ogTitle || pageTitle || "Contenido de Internet";
+ 
+             // Clean up page noise
+-            $("script, style, header, footer, nav, iframe, noscript, svg, .subscription-widget-wrap, .comments-section").remove();
++            $("script, style, header, footer, nav, iframe, noscript, svg, .subscription-widget-wrap, .comments-section, #comments, .comments-area, .comment-list, #respond, .comment-respond").remove();
+ 
+             // Extract content from Substack / blogs / articles
+             let bodyText = "";
+@@ -905,6 +986,23 @@
+             }
+ 
+             textToAnalyze = bodyText.substring(0, 45000);
++
++            // Podcast: si la página trae un archivo de audio y su texto es solo la ficha del episodio,
++            // el contenido real está en el audio, no en las notas.
++            const audioCandidates = process.env.AUTO_TRANSCRIBE === "false" ? [] : findAudioCandidates(html, response.finalUrl);
++            if (audioCandidates.length > 0 && (contentType === "podcast" || bodyText.length < 6000)) {
++              effectiveContentType = "podcast";
++              const notes = textToAnalyze;
++              const pod = await podcastTranscript(audioCandidates, title);
++              if (pod.ok) {
++                transcript = pod.text;
++                transcriptInfo = pod.info;
++                textToAnalyze = `--- NOTAS DEL EPISODIO (texto de la página web) ---\n${notes}\n--- FIN DE LAS NOTAS ---\n\n--- TRANSCRIPCIÓN AUTOMÁTICA DEL AUDIO (IA; con marcas de tiempo [MM:SS]) ---\n${pod.text}\n--- FIN DE LA TRANSCRIPCIÓN ---`;
++              } else {
++                console.warn("Podcast: no se pudo transcribir el audio, se analizan solo las notas:", pod.error);
++                transcriptInfo = { source: "show-notes", generatedBy: "pagina", complete: false, note: `No se pudo transcribir el audio: ${pod.error}`.slice(0, 500) };
++              }
++            }
+           }
+         } catch (scrapeErr: any) {
+           if (scrapeErr instanceof UnsafeUrlError) throw scrapeErr; // p. ej. redirección a IP privada → 400
+@@ -914,6 +1012,8 @@
+         }
+       }
+ 
++      if (textToAnalyze.length > MAX_MEDIA_TEXT_CHARS) textToAnalyze = textToAnalyze.substring(0, MAX_MEDIA_TEXT_CHARS);
++
+       if (contentParts.length === 0 && (!textToAnalyze || textToAnalyze.trim().length < 10)) {
+         return res.status(400).json({ error: "No se pudo extraer suficiente contenido, documento o imagen para analizar." });
+       }
+@@ -1044,7 +1144,7 @@
+ `;
+ 
+       let userPrompt = "";
+-      if (imageList.length > 0) {
++      if (imageList.length > 0 && !ocrApplied) {
+         userPrompt = `
+ Has recibido ${imageList.length} fotografía(s) de un artículo de prensa, periódico, revista o documento impreso.
+ Lee y transcribe minuciosamente el texto impreso, las cabeceras, subtítulos, pies de foto y los datos estadísticos visibles en la(s) foto(s).
+@@ -1060,6 +1160,8 @@
+ Texto extraído o referencia:
+ ${textToAnalyze}
+ `;
++        const mediaNote = mediaNoteFor(transcriptInfo);
++        if (mediaNote) userPrompt += `\n${mediaNote}\n`;
+       }
+ 
+       // Notas de contexto curadas: solo se activan si el texto trata ese asunto; la comprobación de "qué reconoce el texto" es determinista
+@@ -1370,6 +1472,8 @@
+         categories: result.categories || [],
+         translation: result.translation || undefined,
+         originalExtractedText: textToAnalyze || undefined,
++        transcript: transcript || undefined,
++        transcriptInfo: transcript || transcriptInfo ? transcriptInfo : undefined,
+         executiveSummary: result.executiveSummary || "",
+         keyPoints: result.keyPoints || [],
+         numericalExamples: result.numericalExamples || [],
+@@ -1381,7 +1485,7 @@
+         scoutAssessment: sanitizeScout(result.scoutAssessment),
+         contextNotes: contextNotes.length ? contextNotes : undefined,
+         analyzedAt: new Date().toISOString(),
+-        contentType: isDoc ? "document" : (isPhoto ? "photo" : (contentType || "blog")),
++        contentType: (isDoc ? "document" : (isPhoto ? "photo" : (effectiveContentType || "blog"))) as AnalysisResult["contentType"],
+         photoUrls: imageList.length > 0 ? imageList : undefined,
+         fileNames: documentNames.length > 0 ? documentNames : undefined,
+         overallReliabilityScore: overallReliabilityScore
+@@ -1437,7 +1541,7 @@
+           if (response.ok) {
+             const html = await response.text();
+             const $ = cheerio.load(html);
+-            $("script, style, header, footer, nav, iframe, noscript, svg, .subscription-widget-wrap, .comments-section").remove();
++            $("script, style, header, footer, nav, iframe, noscript, svg, .subscription-widget-wrap, .comments-section, #comments, .comments-area, .comment-list, #respond, .comment-respond").remove();
+             targetText = $("article").text().trim() || $("main").text().trim() || $("body").text().trim();
+             targetText = targetText.substring(0, 50000);
+           }
+diff -ruN a/src/App.tsx b/src/App.tsx
+--- a/src/App.tsx	2026-10-29 21:43:21.192671474 +0000
++++ b/src/App.tsx	2026-10-29 21:43:21.195579661 +0000
+@@ -235,6 +235,16 @@
+   userFeedback?: string;
+ }
+ 
++interface TranscriptInfo {
++  source: "audio" | "youtube-captions" | "youtube-video" | "ocr" | "show-notes" | "none";
++  generatedBy: "ia" | "subtitulos" | "pagina";
++  complete: boolean;
++  model?: string;
++  passes?: number;
++  audioUrl?: string;
++  note?: string;
++}
++
+ interface FrozenInfo {
+   contentHash: string;
+   pipelineVersion: string;
+@@ -252,6 +262,8 @@
+   categories: string[];
+   translation?: string;
+   originalExtractedText?: string;
++  transcript?: string;
++  transcriptInfo?: TranscriptInfo;
+   executiveSummary: string;
+   keyPoints: string[];
+   numericalExamples?: NumericalExample[];
+@@ -320,6 +332,7 @@
+   const [reuseNotice, setReuseNotice] = useState<string | null>(null);
+   const [copiedNotion, setCopiedNotion] = useState(false);
+   const [translationCopied, setTranslationCopied] = useState(false);
++  const [transcriptCopied, setTranscriptCopied] = useState(false);
+   const [isTranslatingFull, setIsTranslatingFull] = useState(false);
+   const [deleteTarget, setDeleteTarget] = useState<{ id: string; title: string } | null>(null);
+   const [showClearAllModal, setShowClearAllModal] = useState(false);
+@@ -553,6 +566,36 @@
+     setTimeout(() => setTranslationCopied(false), 2000);
+   };
+ 
++  const handleCopyTranscript = (text: string) => {
++    navigator.clipboard.writeText(text);
++    setTranscriptCopied(true);
++    setTimeout(() => setTranscriptCopied(false), 2000);
++  };
++
++  const transcriptSourceLabel = (info?: TranscriptInfo): string => {
++    switch (info?.source) {
++      case "audio": return "Transcrita por IA a partir del audio";
++      case "youtube-video": return "Transcrita por IA a partir del vídeo";
++      case "youtube-captions": return "Subtítulos de YouTube";
++      case "ocr": return "Texto leído de la foto por IA (OCR)";
++      case "show-notes": return "Solo notas de la página (sin audio)";
++      default: return "Sin transcripción";
++    }
++  };
++
++  const handleDownloadTranscript = (a: AnalysisResult) => {
++    const text = a.transcript || "";
++    const blob = new Blob([`TRANSCRIPCIÓN - LUPA CRÍTICA\nTítulo: ${a.title}\nFuente: ${a.url || "(sin URL)"}\nOrigen: ${transcriptSourceLabel(a.transcriptInfo)}${a.transcriptInfo?.complete === false ? " (INCOMPLETA)" : ""}\nGenerada: ${new Date(a.analyzedAt).toLocaleString()}\nAviso: transcripción automática; puede contener errores. Contrasta con el original.\n\n=========================================\n\n${text}`], { type: "text/plain;charset=utf-8" });
++    const url = URL.createObjectURL(blob);
++    const el = document.createElement("a");
++    el.href = url;
++    el.download = `Transcripcion_${a.title.replace(/[^a-z0-9]/gi, "_").substring(0, 35)}.txt`;
++    document.body.appendChild(el);
++    el.click();
++    document.body.removeChild(el);
++    URL.revokeObjectURL(url);
++  };
++
+   const handleDownloadTranslation = (title: string, text: string) => {
+     const blob = new Blob([`TRADUCCIÓN E HISTORIAL DE ANÁLISIS - LUPA CRÍTICA\nTítulo: ${title}\nFecha: ${new Date().toLocaleString()}\n\n=========================================\nTRADUCCIÓN ÍNTEGRA Y EXHAUSTIVA AL CASTELLANO\n=========================================\n\n${text}`], { type: "text/plain;charset=utf-8" });
+     const url = URL.createObjectURL(blob);
+@@ -682,6 +725,14 @@
+       "Generando resumen ejecutivo y posiciones críticas universitarias...",
+       "Contrastando fuentes en registros de revisión por pares (OpenAlex, Crossref)...",
+       "Verificando citas indexadas en Google Scholar y repositorios académicos..."
++    ] : (activeTab === "url" && (contentType === "podcast" || /youtu\.?be/i.test(targetUrl !== undefined ? targetUrl : url))) ? [
++      "Localizando el audio o el vídeo del recurso...",
++      "Descargando y preparando el archivo (puede tardar)...",
++      "Transcribiendo con IA: en episodios largos son varios minutos...",
++      "Analizando la transcripción e identificando el idioma...",
++      "Generando resumen ejecutivo y posiciones críticas...",
++      "Contrastando fuentes en registros de revisión por pares (OpenAlex, Crossref)...",
++      "Evaluando el rigor académico y calculando índices de credibilidad..."
+     ] : [
+       "Iniciando raspado y extracción de datos del recurso...",
+       "Analizando la estructura y el idioma del contenido original...",
+@@ -958,6 +1009,13 @@
+       md += `## Transcripción y Traducción Exhaustiva al Castellano\n\n${analysis.translation.trim()}\n\n`;
+     }
+ 
++    // 8b. Transcripción del audio/vídeo o texto OCR de las fotos
++    if (analysis.transcript) {
++      md += `## Transcripción (${transcriptSourceLabel(analysis.transcriptInfo)}${analysis.transcriptInfo?.complete === false ? ", INCOMPLETA" : ""})\n\n`;
++      md += `> Transcripción automática: puede contener errores. Contrasta con el original antes de citarla.\n\n`;
++      md += `${analysis.transcript.trim()}\n\n`;
++    }
++
+     // 9. Fuentes Bibliográficas e Investigación Secundaria Verificada
+     if (analysis.bibliographicSources && analysis.bibliographicSources.length > 0) {
+       md += `## Fuentes bibliográficas (con estado de verificación)\n\n`;
+@@ -2601,6 +2659,78 @@
+                     </div>
+                   )}
+ 
++                  {/* Transcripción del audio / vídeo / OCR de fotos (separada de la traducción) */}
++                  {selectedAnalysis.transcript ? (
++                    <div className="bg-slate-50 border border-sky-200 rounded-xl p-6 shadow-xs">
++                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4 pb-3 border-b border-sky-200/80">
++                        <div>
++                          <div className="flex items-center gap-2">
++                            {selectedAnalysis.transcriptInfo?.source === "ocr" ? <Camera className="w-5 h-5 text-sky-600" /> : <Mic className="w-5 h-5 text-sky-600" />}
++                            <h3 className="text-lg font-display font-semibold text-slate-900">
++                              {selectedAnalysis.transcriptInfo?.source === "ocr" ? "Texto transcrito de la foto" : "Transcripción"}
++                            </h3>
++                          </div>
++                          <div className="flex flex-wrap items-center gap-2 mt-1.5 text-xs text-slate-500">
++                            <span className="text-[10px] font-mono font-medium text-sky-800 bg-sky-50 border border-sky-200 px-2 py-0.5 rounded-full">
++                              {transcriptSourceLabel(selectedAnalysis.transcriptInfo)}
++                            </span>
++                            {selectedAnalysis.transcriptInfo?.complete === false && (
++                              <span className="text-[10px] font-mono font-medium text-amber-800 bg-amber-50 border border-amber-300 px-2 py-0.5 rounded-full">
++                                Posiblemente incompleta
++                              </span>
++                            )}
++                            <span className="text-[11px] font-mono text-slate-500">
++                              ~{selectedAnalysis.transcript.split(/\s+/).filter(Boolean).length} palabras
++                            </span>
++                          </div>
++                        </div>
++                        <div className="flex items-center gap-2 self-start sm:self-center shrink-0">
++                          <button
++                            type="button"
++                            onClick={() => handleCopyTranscript(selectedAnalysis.transcript || "")}
++                            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white hover:bg-slate-100 border border-slate-200 rounded-lg text-xs font-semibold text-slate-700 transition-colors"
++                            title="Copiar la transcripción al portapapeles"
++                          >
++                            {transcriptCopied ? (
++                              <><Check className="w-3.5 h-3.5 text-emerald-600" /><span className="text-emerald-700">¡Copiado!</span></>
++                            ) : (
++                              <><Copy className="w-3.5 h-3.5 text-slate-500" /><span>Copiar</span></>
++                            )}
++                          </button>
++                          <button
++                            type="button"
++                            onClick={() => handleDownloadTranscript(selectedAnalysis)}
++                            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white hover:bg-slate-100 border border-slate-200 rounded-lg text-xs font-semibold text-slate-700 transition-colors"
++                            title="Descargar la transcripción en un archivo .txt"
++                          >
++                            <Download className="w-3.5 h-3.5 text-slate-500" />
++                            <span>Descargar TXT</span>
++                          </button>
++                        </div>
++                      </div>
++                      <p className="text-xs text-slate-600 mb-4 leading-relaxed">
++                        {selectedAnalysis.transcriptInfo?.generatedBy === "ia"
++                          ? "Generada automáticamente por IA: puede contener errores en nombres propios y cifras. Usa las marcas de tiempo [MM:SS] para comprobar un pasaje en el original antes de citarlo."
++                          : selectedAnalysis.transcriptInfo?.generatedBy === "subtitulos"
++                            ? "Subtítulos de YouTube: suelen ser automáticos, sin puntuación y con errores en nombres propios y cifras."
++                            : "Texto obtenido de la página."}
++                        {selectedAnalysis.transcriptInfo?.note ? ` ${selectedAnalysis.transcriptInfo.note}` : ""}
++                        {selectedAnalysis.transcriptInfo?.source === "ocr" ? " Si hay errores, corrige el texto y pégalo en la pestaña «Texto» para reanalizarlo." : ""}
++                      </p>
++                      <div className="p-6 bg-white border border-slate-200 rounded-xl text-sm leading-relaxed text-slate-800 font-sans max-h-[600px] overflow-y-auto whitespace-pre-wrap">
++                        {selectedAnalysis.transcript}
++                      </div>
++                    </div>
++                  ) : selectedAnalysis.transcriptInfo && selectedAnalysis.transcriptInfo.source !== "audio" && selectedAnalysis.transcriptInfo.generatedBy === "pagina" ? (
++                    <div className="bg-amber-50/70 border border-amber-200 rounded-xl p-5 text-sm text-amber-900 flex items-start gap-3">
++                      <AlertCircle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
++                      <div>
++                        <p className="font-semibold">{transcriptSourceLabel(selectedAnalysis.transcriptInfo)}</p>
++                        <p className="text-xs mt-1 leading-relaxed">{selectedAnalysis.transcriptInfo.note || "No se pudo obtener la transcripción: este análisis se basa solo en el texto de la página."}</p>
++                      </div>
++                    </div>
++                  ) : null}
++
+                   {/* Translation display (Full unabridged version or translation generator) */}
+                   {selectedAnalysis.translation ? (
+                     <div className="bg-slate-50 border border-amber-200 rounded-xl p-6 shadow-xs relative overflow-hidden">
+diff -ruN a/tests/media.test.ts b/tests/media.test.ts
+--- a/tests/media.test.ts	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/media.test.ts	2026-10-29 21:43:21.229542577 +0000
+@@ -0,0 +1,159 @@
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import {
++  END_MARKER,
++  downloadFirstAudio,
++  findAudioCandidates,
++  isDirectAudioUrl,
++  mimeCandidatesFor,
++  transcribeImages,
++  transcribeYouTubeVideo,
++} from "../server/media";
++import { safeDownload, UnsafeUrlError } from "../server/safeFetch";
++
++const M4A = "https://d3ctxlq1ktw2nl.cloudfront.net/staging/2026-9-8/433672626-44100-2-f4fc366266284.m4a";
++const PAGE = "https://www.joseantoniomarina.net/el-panoptico-podcast/ep-5x01-centro-de-vacunacion-contra-la-insensatez/";
++
++// Estructura real de la página de El Panóptico (plugin Seriously Simple Podcasting): el audio solo aparece en
++// un enlace "Descarga", en el title de una imagen y como URL suelta; el reproductor no lleva <audio src>.
++const PANOPTICO_HTML = `
++<html><head><meta property="og:title" content="Ep. 5x01"></head><body>
++<article><h1>Ep. 5×01: Centro de vacunación contra la insensatez</h1>
++<p>Bienvenidos a la 5ª Temporada de El Panóptico.</p>
++<h3>Acceso al podcast</h3>
++<img src="https://www.joseantoniomarina.net/wp-content/uploads/2026/10/Caratula-150x150.png" alt="${M4A}" title="${M4A}">
++<div class="ssp-player">${M4A}</div>
++<a href="https://www.joseantoniomarina.net/podcast-download/18486/ep-5x01-centro-de-vacunacion-contra-la-insensatez?ref=new_window">Reproducir en una nueva ventana</a>
++<a href="${M4A}" title="Descarga">Descarga</a>
++</article></body></html>`;
++
++test("findAudioCandidates localiza el .m4a de El Panóptico y lo pone antes que el enlace de descarga", () => {
++  const c = findAudioCandidates(PANOPTICO_HTML, PAGE);
++  assert.equal(c[0], M4A);
++  assert.equal(c.filter((u) => u === M4A).length, 1, "sin duplicados");
++  assert.ok(c.some((u) => u.includes("/podcast-download/18486/")), "conserva la descarga con redirección como alternativa");
++  assert.ok(c.indexOf(M4A) < c.findIndex((u) => u.includes("/podcast-download/")));
++});
++
++test("findAudioCandidates: og:audio, <audio>, JSON-LD y rutas relativas", () => {
++  const html = `<head>
++    <meta property="og:audio" content="/media/ep1.mp3?x=1&amp;y=2">
++    <script type="application/ld+json">{"@type":"PodcastEpisode","associatedMedia":{"@type":"AudioObject","contentUrl":"https://cdn.example.org/a/ep2.ogg"}}</script>
++  </head><body><audio controls><source src="stream/ep3.wav"></audio></body>`;
++  const c = findAudioCandidates(html, "https://example.org/podcast/ep/");
++  assert.ok(c.includes("https://example.org/media/ep1.mp3?x=1&y=2"));
++  assert.ok(c.includes("https://cdn.example.org/a/ep2.ogg"));
++  assert.ok(c.includes("https://example.org/podcast/ep/stream/ep3.wav"));
++});
++
++test("findAudioCandidates: una página sin audio devuelve lista vacía y no falla con JSON-LD roto", () => {
++  const html = `<html><head><script type="application/ld+json">{roto</script></head><body><p>Un artículo normal.</p><a href="/otra-pagina">x</a></body></html>`;
++  assert.deepEqual(findAudioCandidates(html, "https://example.org/blog/post"), []);
++});
++
++test("isDirectAudioUrl y mimeCandidatesFor", () => {
++  assert.equal(isDirectAudioUrl(`${M4A}?token=1`), true);
++  assert.equal(isDirectAudioUrl("https://example.org/podcast-download/1/ep"), false);
++  assert.equal(isDirectAudioUrl("no es una url"), false);
++  assert.deepEqual(mimeCandidatesFor(M4A, "audio/x-m4a").slice(0, 3), ["audio/m4a", "audio/mp4", "audio/aac"]);
++  assert.ok(mimeCandidatesFor(M4A, "audio/x-m4a").includes("audio/x-m4a"));
++  assert.deepEqual(mimeCandidatesFor("https://x.org/e.mp3"), ["audio/mp3", "audio/mpeg"]);
++  assert.ok(mimeCandidatesFor("https://x.org/stream").length >= 2, "sin extensión: alternativas por defecto");
++});
++
++test("safeDownload y downloadFirstAudio rechazan destinos internos sin tocar la red", async () => {
++  await assert.rejects(() => safeDownload("http://127.0.0.1/a.mp3", "/tmp/x.bin"), UnsafeUrlError);
++  await assert.rejects(() => safeDownload("http://169.254.169.254/latest/meta-data", "/tmp/x.bin"), UnsafeUrlError);
++  const r = await downloadFirstAudio(["http://localhost/a.mp3", "http://10.0.0.5/b.mp3"]);
++  assert.equal(r.audio, null);
++  assert.equal(r.errors.length, 2);
++});
++
++// ── Gemini simulado ──
++function fakeAi(responses: Array<{ text?: string; finishReason?: string; throws?: string }>, calls: any[] = []) {
++  let i = 0;
++  return {
++    calls,
++    ai: {
++      models: {
++        generateContent: async (req: any) => {
++          calls.push(req);
++          const r = responses[Math.min(i++, responses.length - 1)];
++          if (r.throws) throw new Error(r.throws);
++          return { text: r.text ?? "", candidates: [{ finishReason: r.finishReason || "STOP" }] };
++        },
++      },
++    } as any,
++  };
++}
++
++test("transcribeYouTubeVideo: una pasada con marca de fin → completa y sin la marca en el texto", async () => {
++  const { ai, calls } = fakeAi([{ text: `[00:00] Voz 1: Hola a todos.\n\n[00:05] Voz 1: Empezamos.\n${END_MARKER}` }]);
++  const r = await transcribeYouTubeVideo({ ai, models: ["m1"] }, "https://www.youtube.com/watch?v=abc");
++  assert.equal(r.complete, true);
++  assert.equal(r.passes, 1);
++  assert.ok(!r.text.includes("FIN DE LA TRANSCRIPCIÓN"));
++  assert.ok(r.text.includes("Empezamos."));
++  assert.equal(calls[0].contents[0].parts[0].fileData.fileUri, "https://www.youtube.com/watch?v=abc");
++  assert.equal(calls[0].config.temperature, 0);
++});
++
++test("transcribeYouTubeVideo: si el modelo se corta, continúa desde lo último transcrito y concatena", async () => {
++  const { ai, calls } = fakeAi([
++    { text: "[00:00] Voz 1: Primera parte de la charla.", finishReason: "MAX_TOKENS" },
++    { text: `[10:00] Voz 1: Segunda parte y cierre.\n${END_MARKER}` },
++  ]);
++  const r = await transcribeYouTubeVideo({ ai, models: ["m1"] }, "https://youtu.be/abc");
++  assert.equal(r.complete, true);
++  assert.equal(r.passes, 2);
++  assert.match(r.text, /Primera parte[\s\S]*Segunda parte/);
++  const secondPrompt = calls[1].contents[0].parts[1].text as string;
++  assert.ok(secondPrompt.includes("Primera parte de la charla."), "el prompt de continuación cita el final anterior");
++});
++
++test("transcribeYouTubeVideo: sin marca de fin se declara incompleta (no se da por buena)", async () => {
++  const { ai } = fakeAi([{ text: "[00:00] Voz 1: Algo." }, { text: "" }]);
++  const r = await transcribeYouTubeVideo({ ai, models: ["m1"] }, "https://youtu.be/abc");
++  assert.equal(r.complete, false);
++  assert.ok(r.note && /no confirmó el final/i.test(r.note));
++});
++
++test("transcribeYouTubeVideo: un modelo que se repite en la continuación se corta y se avisa", async () => {
++  const bloque = "[00:00] Voz 1: Este es un párrafo suficientemente largo para detectar la repetición del modelo en la continuación del texto.";
++  const { ai } = fakeAi([{ text: bloque, finishReason: "MAX_TOKENS" }, { text: bloque, finishReason: "MAX_TOKENS" }]);
++  const r = await transcribeYouTubeVideo({ ai, models: ["m1"] }, "https://youtu.be/abc");
++  assert.equal(r.complete, false);
++  assert.ok(r.note && /repetirse/i.test(r.note));
++  assert.equal(r.text, bloque, "no duplica el bloque repetido");
++});
++
++test("generateWithFallback: ante un 503 persistente en el primer modelo, pasa al siguiente", { timeout: 20_000 }, async () => {
++  const seen: string[] = [];
++  const ai: any = {
++    models: {
++      generateContent: async (req: any) => {
++        seen.push(req.model);
++        if (req.model === "m1") throw new Error("503 UNAVAILABLE high demand");
++        return { text: `[00:00] ok\n${END_MARKER}`, candidates: [{ finishReason: "STOP" }] };
++      },
++    },
++  };
++  const r = await transcribeYouTubeVideo({ ai, models: ["m1", "m2"] }, "https://youtu.be/abc");
++  assert.equal(r.model, "m2");
++  assert.deepEqual(seen, ["m1", "m1", "m2"]);
++});
++
++test("transcribeImages: envía las imágenes como inlineData y devuelve el texto literal", async () => {
++  const { ai, calls } = fakeAi([{ text: "TITULAR\n\nCuerpo [?]" }]);
++  const r = await transcribeImages({ ai, models: ["m1"] }, [
++    { mimeType: "image/jpeg", data: "AAAA" },
++    { mimeType: "image/png", data: "BBBB" },
++  ]);
++  assert.equal(r.text, "TITULAR\n\nCuerpo [?]");
++  const parts = calls[0].contents[0].parts;
++  assert.equal(parts.length, 3);
++  assert.equal(parts[0].inlineData.mimeType, "image/jpeg");
++  assert.equal(parts[1].inlineData.data, "BBBB");
++  assert.match(parts[2].text, /Imagen N/);
++  assert.deepEqual(await transcribeImages({ ai, models: ["m1"] }, []), { text: "", model: "m1" });
++});
