@@ -235,6 +235,16 @@ interface FactCheckAudit {
   userFeedback?: string;
 }
 
+interface TranscriptInfo {
+  source: "audio" | "youtube-captions" | "youtube-video" | "ocr" | "show-notes" | "none";
+  generatedBy: "ia" | "subtitulos" | "pagina";
+  complete: boolean;
+  model?: string;
+  passes?: number;
+  audioUrl?: string;
+  note?: string;
+}
+
 interface FrozenInfo {
   contentHash: string;
   pipelineVersion: string;
@@ -252,6 +262,8 @@ interface AnalysisResult {
   categories: string[];
   translation?: string;
   originalExtractedText?: string;
+  transcript?: string;
+  transcriptInfo?: TranscriptInfo;
   executiveSummary: string;
   keyPoints: string[];
   numericalExamples?: NumericalExample[];
@@ -320,6 +332,7 @@ export default function App() {
   const [reuseNotice, setReuseNotice] = useState<string | null>(null);
   const [copiedNotion, setCopiedNotion] = useState(false);
   const [translationCopied, setTranslationCopied] = useState(false);
+  const [transcriptCopied, setTranscriptCopied] = useState(false);
   const [isTranslatingFull, setIsTranslatingFull] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; title: string } | null>(null);
   const [showClearAllModal, setShowClearAllModal] = useState(false);
@@ -553,6 +566,36 @@ export default function App() {
     setTimeout(() => setTranslationCopied(false), 2000);
   };
 
+  const handleCopyTranscript = (text: string) => {
+    navigator.clipboard.writeText(text);
+    setTranscriptCopied(true);
+    setTimeout(() => setTranscriptCopied(false), 2000);
+  };
+
+  const transcriptSourceLabel = (info?: TranscriptInfo): string => {
+    switch (info?.source) {
+      case "audio": return "Transcrita por IA a partir del audio";
+      case "youtube-video": return "Transcrita por IA a partir del vídeo";
+      case "youtube-captions": return "Subtítulos de YouTube";
+      case "ocr": return "Texto leído de la foto por IA (OCR)";
+      case "show-notes": return "Solo notas de la página (sin audio)";
+      default: return "Sin transcripción";
+    }
+  };
+
+  const handleDownloadTranscript = (a: AnalysisResult) => {
+    const text = a.transcript || "";
+    const blob = new Blob([`TRANSCRIPCIÓN - LUPA CRÍTICA\nTítulo: ${a.title}\nFuente: ${a.url || "(sin URL)"}\nOrigen: ${transcriptSourceLabel(a.transcriptInfo)}${a.transcriptInfo?.complete === false ? " (INCOMPLETA)" : ""}\nGenerada: ${new Date(a.analyzedAt).toLocaleString()}\nAviso: transcripción automática; puede contener errores. Contrasta con el original.\n\n=========================================\n\n${text}`], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const el = document.createElement("a");
+    el.href = url;
+    el.download = `Transcripcion_${a.title.replace(/[^a-z0-9]/gi, "_").substring(0, 35)}.txt`;
+    document.body.appendChild(el);
+    el.click();
+    document.body.removeChild(el);
+    URL.revokeObjectURL(url);
+  };
+
   const handleDownloadTranslation = (title: string, text: string) => {
     const blob = new Blob([`TRADUCCIÓN E HISTORIAL DE ANÁLISIS - LUPA CRÍTICA\nTítulo: ${title}\nFecha: ${new Date().toLocaleString()}\n\n=========================================\nTRADUCCIÓN ÍNTEGRA Y EXHAUSTIVA AL CASTELLANO\n=========================================\n\n${text}`], { type: "text/plain;charset=utf-8" });
     const url = URL.createObjectURL(blob);
@@ -682,6 +725,14 @@ export default function App() {
       "Generando resumen ejecutivo y posiciones críticas universitarias...",
       "Contrastando fuentes en registros de revisión por pares (OpenAlex, Crossref)...",
       "Verificando citas indexadas en Google Scholar y repositorios académicos..."
+    ] : (activeTab === "url" && (contentType === "podcast" || /youtu\.?be/i.test(targetUrl !== undefined ? targetUrl : url))) ? [
+      "Localizando el audio o el vídeo del recurso...",
+      "Descargando y preparando el archivo (puede tardar)...",
+      "Transcribiendo con IA: en episodios largos son varios minutos...",
+      "Analizando la transcripción e identificando el idioma...",
+      "Generando resumen ejecutivo y posiciones críticas...",
+      "Contrastando fuentes en registros de revisión por pares (OpenAlex, Crossref)...",
+      "Evaluando el rigor académico y calculando índices de credibilidad..."
     ] : [
       "Iniciando raspado y extracción de datos del recurso...",
       "Analizando la estructura y el idioma del contenido original...",
@@ -956,6 +1007,13 @@ export default function App() {
     // 8. Transcripción y Traducción Exhaustiva al Castellano (si aplica)
     if (analysis.translation) {
       md += `## Transcripción y Traducción Exhaustiva al Castellano\n\n${analysis.translation.trim()}\n\n`;
+    }
+
+    // 8b. Transcripción del audio/vídeo o texto OCR de las fotos
+    if (analysis.transcript) {
+      md += `## Transcripción (${transcriptSourceLabel(analysis.transcriptInfo)}${analysis.transcriptInfo?.complete === false ? ", INCOMPLETA" : ""})\n\n`;
+      md += `> Transcripción automática: puede contener errores. Contrasta con el original antes de citarla.\n\n`;
+      md += `${analysis.transcript.trim()}\n\n`;
     }
 
     // 9. Fuentes Bibliográficas e Investigación Secundaria Verificada
@@ -2600,6 +2658,78 @@ export default function App() {
                       </div>
                     </div>
                   )}
+
+                  {/* Transcripción del audio / vídeo / OCR de fotos (separada de la traducción) */}
+                  {selectedAnalysis.transcript ? (
+                    <div className="bg-slate-50 border border-sky-200 rounded-xl p-6 shadow-xs">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4 pb-3 border-b border-sky-200/80">
+                        <div>
+                          <div className="flex items-center gap-2">
+                            {selectedAnalysis.transcriptInfo?.source === "ocr" ? <Camera className="w-5 h-5 text-sky-600" /> : <Mic className="w-5 h-5 text-sky-600" />}
+                            <h3 className="text-lg font-display font-semibold text-slate-900">
+                              {selectedAnalysis.transcriptInfo?.source === "ocr" ? "Texto transcrito de la foto" : "Transcripción"}
+                            </h3>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-2 mt-1.5 text-xs text-slate-500">
+                            <span className="text-[10px] font-mono font-medium text-sky-800 bg-sky-50 border border-sky-200 px-2 py-0.5 rounded-full">
+                              {transcriptSourceLabel(selectedAnalysis.transcriptInfo)}
+                            </span>
+                            {selectedAnalysis.transcriptInfo?.complete === false && (
+                              <span className="text-[10px] font-mono font-medium text-amber-800 bg-amber-50 border border-amber-300 px-2 py-0.5 rounded-full">
+                                Posiblemente incompleta
+                              </span>
+                            )}
+                            <span className="text-[11px] font-mono text-slate-500">
+                              ~{selectedAnalysis.transcript.split(/\s+/).filter(Boolean).length} palabras
+                            </span>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2 self-start sm:self-center shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => handleCopyTranscript(selectedAnalysis.transcript || "")}
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white hover:bg-slate-100 border border-slate-200 rounded-lg text-xs font-semibold text-slate-700 transition-colors"
+                            title="Copiar la transcripción al portapapeles"
+                          >
+                            {transcriptCopied ? (
+                              <><Check className="w-3.5 h-3.5 text-emerald-600" /><span className="text-emerald-700">¡Copiado!</span></>
+                            ) : (
+                              <><Copy className="w-3.5 h-3.5 text-slate-500" /><span>Copiar</span></>
+                            )}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleDownloadTranscript(selectedAnalysis)}
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white hover:bg-slate-100 border border-slate-200 rounded-lg text-xs font-semibold text-slate-700 transition-colors"
+                            title="Descargar la transcripción en un archivo .txt"
+                          >
+                            <Download className="w-3.5 h-3.5 text-slate-500" />
+                            <span>Descargar TXT</span>
+                          </button>
+                        </div>
+                      </div>
+                      <p className="text-xs text-slate-600 mb-4 leading-relaxed">
+                        {selectedAnalysis.transcriptInfo?.generatedBy === "ia"
+                          ? "Generada automáticamente por IA: puede contener errores en nombres propios y cifras. Usa las marcas de tiempo [MM:SS] para comprobar un pasaje en el original antes de citarlo."
+                          : selectedAnalysis.transcriptInfo?.generatedBy === "subtitulos"
+                            ? "Subtítulos de YouTube: suelen ser automáticos, sin puntuación y con errores en nombres propios y cifras."
+                            : "Texto obtenido de la página."}
+                        {selectedAnalysis.transcriptInfo?.note ? ` ${selectedAnalysis.transcriptInfo.note}` : ""}
+                        {selectedAnalysis.transcriptInfo?.source === "ocr" ? " Si hay errores, corrige el texto y pégalo en la pestaña «Texto» para reanalizarlo." : ""}
+                      </p>
+                      <div className="p-6 bg-white border border-slate-200 rounded-xl text-sm leading-relaxed text-slate-800 font-sans max-h-[600px] overflow-y-auto whitespace-pre-wrap">
+                        {selectedAnalysis.transcript}
+                      </div>
+                    </div>
+                  ) : selectedAnalysis.transcriptInfo && selectedAnalysis.transcriptInfo.source !== "audio" && selectedAnalysis.transcriptInfo.generatedBy === "pagina" ? (
+                    <div className="bg-amber-50/70 border border-amber-200 rounded-xl p-5 text-sm text-amber-900 flex items-start gap-3">
+                      <AlertCircle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                      <div>
+                        <p className="font-semibold">{transcriptSourceLabel(selectedAnalysis.transcriptInfo)}</p>
+                        <p className="text-xs mt-1 leading-relaxed">{selectedAnalysis.transcriptInfo.note || "No se pudo obtener la transcripción: este análisis se basa solo en el texto de la página."}</p>
+                      </div>
+                    </div>
+                  ) : null}
 
                   {/* Translation display (Full unabridged version or translation generator) */}
                   {selectedAnalysis.translation ? (
