@@ -2,7 +2,10 @@
 // Defensa en capas: (1) validación sintáctica, (2) validación de la IP en el MOMENTO de conectar
 // (cierra DNS-rebinding), (3) redirecciones manuales revalidadas, (4) timeout y tope de bytes.
 import dns from "node:dns";
+import fs from "node:fs";
 import net from "node:net";
+import { Readable, Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { Agent, fetch as undiciFetch } from "undici";
 
 export class UnsafeUrlError extends Error {
@@ -176,6 +179,78 @@ export async function safeFetch(rawUrl: string, opts: SafeFetchOptions = {}): Pr
       text: readOnce,
       json: async () => JSON.parse(await readOnce()),
     };
+  }
+  throw new UnsafeUrlError("Demasiadas redirecciones.");
+}
+
+export interface SafeDownloadOptions {
+  headers?: Record<string, string>;
+  timeoutMs?: number;
+  maxBytes?: number;
+  maxRedirects?: number;
+}
+
+export interface SafeDownloadResult {
+  bytes: number;
+  contentType: string;
+  finalUrl: string;
+}
+
+/**
+ * Descarga binaria (audio) a disco con las mismas defensas anti-SSRF que safeFetch:
+ * validación de URL, IP comprobada al conectar, redirecciones revalidadas y tope de bytes.
+ * Escribe en streaming (no carga el archivo en memoria). Si se supera el tope, borra el parcial y lanza error.
+ */
+export async function safeDownload(rawUrl: string, destPath: string, opts: SafeDownloadOptions = {}): Promise<SafeDownloadResult> {
+  const { headers = {}, timeoutMs = 240_000, maxBytes = 120 * 1024 * 1024, maxRedirects = 5 } = opts;
+  let current = parseAndValidateUrl(rawUrl);
+
+  for (let hop = 0; hop <= maxRedirects; hop++) {
+    const res = await undiciFetch(current.toString(), {
+      method: "GET",
+      headers,
+      redirect: "manual",
+      dispatcher: agent,
+      signal: AbortSignal.timeout(timeoutMs),
+    }).catch((e: any) => {
+      if (e?.cause instanceof UnsafeUrlError) throw e.cause;
+      throw e;
+    });
+
+    if (res.status >= 300 && res.status < 400 && res.headers.get("location")) {
+      await res.body?.cancel();
+      current = parseAndValidateUrl(new URL(res.headers.get("location")!, current).toString());
+      continue;
+    }
+
+    if (res.status < 200 || res.status >= 300) {
+      await res.body?.cancel();
+      throw new Error(`Error al descargar el archivo (${res.status} ${res.statusText}).`);
+    }
+
+    const limitMb = Math.round(maxBytes / 1024 / 1024);
+    const declared = Number(res.headers.get("content-length") || 0);
+    if (declared > maxBytes) {
+      await res.body?.cancel();
+      throw new Error(`El archivo (${Math.round(declared / 1024 / 1024)} MB) supera el límite de ${limitMb} MB.`);
+    }
+    if (!res.body) throw new Error("La respuesta no trae contenido.");
+
+    let total = 0;
+    const limiter = new Transform({
+      transform(chunk, _enc, cb) {
+        total += chunk.length;
+        if (total > maxBytes) cb(new Error(`El archivo supera el límite de ${limitMb} MB.`));
+        else cb(null, chunk);
+      },
+    });
+    try {
+      await pipeline(Readable.fromWeb(res.body as any), limiter, fs.createWriteStream(destPath));
+    } catch (e) {
+      fs.rmSync(destPath, { force: true });
+      throw e;
+    }
+    return { bytes: total, contentType: res.headers.get("content-type") || "", finalUrl: current.toString() };
   }
   throw new UnsafeUrlError("Demasiadas redirecciones.");
 }
