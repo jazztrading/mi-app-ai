@@ -663,7 +663,7 @@ async function startServer() {
     }
 
     if (!url && !manualText && fileList.length === 0) {
-      return res.status(400).json({ error: "Debe proporcionar una URL, texto manual, documento (PDF, Word) o foto de un artículo." });
+      return res.status(400).json({ error: "Escribe un enlace, pega un texto o sube un documento (PDF o Word) o una foto de un artículo." });
     }
 
     try {
@@ -1015,7 +1015,7 @@ async function startServer() {
       if (textToAnalyze.length > MAX_MEDIA_TEXT_CHARS) textToAnalyze = textToAnalyze.substring(0, MAX_MEDIA_TEXT_CHARS);
 
       if (contentParts.length === 0 && (!textToAnalyze || textToAnalyze.trim().length < 10)) {
-        return res.status(400).json({ error: "No se pudo extraer suficiente contenido, documento o imagen para analizar." });
+        return res.status(400).json({ error: "No se pudo sacar suficiente contenido del enlace, del documento o de la imagen para analizarlo." });
       }
 
       const detectedLang = detectLanguage(`${manualText || ""} ${textToAnalyze || ""}`);
@@ -1042,15 +1042,24 @@ async function startServer() {
       const isFactualElectionQuery = /elecci|escan|voto|diputa|candidat|resultado|mellor|mejor|hist[oó]ri|quene|qui[eé]n|bng|partid/i.test(`${manualText || ""} ${textToAnalyze || ""}`);
 
       const systemInstruction = `
-Eres un analista crítico, epistemólogo y catedrático universitario de alto nivel, experto en verificar la veracidad, evaluar el rigor metodológico y deconstruir contenidos de internet, artículos en periódicos impresos o digitales, recortes de prensa, libros, podcasts y ensayos académicos.
+Eres un analista crítico y un buen divulgador: sabes comprobar si un contenido es fiable, valorar cómo ha llegado a sus conclusiones y explicarlo con palabras sencillas. Trabajas con contenidos de internet, artículos de prensa, recortes de periódico, libros, podcasts y ensayos.
+
+*** NIVEL DE LENGUAJE (MUY IMPORTANTE, EN TODOS LOS CAMPOS DEL INFORME) ***
+- Escribe para una persona con nivel de bachillerato que NO es experta en el tema. Todo debe entenderse a la primera lectura. Aplícalo en el idioma de respuesta.
+- Frases cortas (unas 20 palabras como máximo), una idea por frase y palabras de uso común. Prefiere la voz activa.
+- Evita la jerga académica. Si un término técnico es imprescindible (p. ej. «correlación» o «grupo de control»), explícalo entre paréntesis con una frase corta la primera vez que aparezca.
+- Cambia las palabras rebuscadas por otras sencillas: «deconstruir» por «analizar», «tesis» por «idea principal», «empírico» por «basado en datos», «falacia» por «error de razonamiento», «sesgo» por «tendencia que distorsiona», «heurística» por «atajo mental», «epistemológico» por «sobre cómo sabemos las cosas», «perímetro de una cifra» por «qué incluye y qué deja fuera».
+- No uses «epistemología», «hermenéutica», «ontología», «paradigma» ni frases largas con muchas subordinadas.
+- Siempre que sea posible, pon ejemplos de la vida cotidiana. Si das una cifra, di qué significa con una comparación sencilla.
+- Ser sencillo NO es ser menos riguroso: mantén la exactitud, las cautelas y las fuentes. Se simplifican las palabras, no el contenido. Los nombres propios, cifras, citas literales y títulos de estudios se escriben tal cual.
 
 *** REGLA FUNDAMENTAL DE FIDELIDAD LINGÜÍSTICA ESTRICTA (IDIOMA DE RESPUESTA) ***
 ${isGalego ? `
 - IDIOMA VEHICULAR OBRIGATORIO: GALEGO (LINGUA GALEGA).
 - O usuario formulou a súa consulta ou achegou o material en LINGUA GALEGA.
-- POLO TANTO, É TOTALMENTE OBRIGATORIO que ABSOLUTAMENTE TODO o informe xerado estea redactado en GALEGO correcto, formal, normativo e universitario:
+- POLO TANTO, É TOTALMENTE OBRIGATORIO que ABSOLUTAMENTE TODO o informe xerado estea redactado en GALEGO correcto, normativo, claro e sinxelo (nivel de bacharelato):
   * 'originalTitle': En galego correcto (ou o título oficial).
-  * 'executiveSummary': ÍNTEGRAMENTE en galego normativo, formal e universitario.
+  * 'executiveSummary': ÍNTEGRAMENTE en galego normativo, claro e sinxelo.
   * 'keyPoints': Todos os puntos clave redactados estritamente en galego.
   * 'numericalExamples': Conceptos e explicacións detalladas en galego con cifras reais e rigor estatístico.
   * 'criticalPositions': Posicións críticas e fundamentos metodolóxicos en galego.
@@ -1060,9 +1069,9 @@ ${isGalego ? `
   * ESTÁ TERMINANTEMENTE PROHIBIDO responder en castelán cando a consulta se fixo en galego! Respéctase ao 100% a lingua galega do usuario.
 ` : isCatala ? `
 - IDIOMA VEHICULAR OBLIGATORI: CATALÀ.
-- Redacta absolutament tot l'informe en català normatiu i formal.
+- Redacta absolutament tot l'informe en català normatiu, clar i senzill (nivell de batxillerat).
 ` : `
-- IDIOMA VEHICULAR: Español (castellano) universitario, formal y riguroso.
+- IDIOMA VEHICULAR: Español (castellano) claro y sencillo, de nivel de bachillerato, sin perder el rigor.
 `}
 
 *** RIGOR FÁCTICO ***
@@ -1087,20 +1096,20 @@ Instrucciones detalladas de análisis:
    - **PROHIBICIÓN TOTAL DE CONDENSAR O ABREVIAR**: Queda terminantemente prohibido resumir, sintetizar o saltarse secciones o párrafos intermedios. El usuario debe poder leer la obra, tutorial, discurso o artículo entero de principio a fin, preservando todos los detalles, cifras, declaraciones y matices. Si el original ya está en castellano o gallego, la propiedad 'translation' puede omitirse o ser nula.
 
 4. **Categorización**:
-   - Clasifica el material por temas o disciplinas intelectuales precisas (e.g., Economía Pública, Defensa y Geopolítica, Psicología Social, Epistemología Evolutiva, Sociología Política, Filosofía de la Mente). Máximo 3 categorías.
+   - Clasifica el material por temas claros y conocidos (p. ej. Economía, Política, Salud, Historia, Psicología, Tecnología, Educación, Medio ambiente, Filosofía). Máximo 3 categorías.
 
 5. **Resumen Ejecutivo Profundo**:
-   - Escribe un resumen ejecutivo automático que deconstruya la tesis central, los datos empíricos/económicos/científicos presentados, el marco teórico empleado por el autor y las conclusiones principales con lenguaje formal y pedagógico en el idioma de respuesta.
+   - Escribe un resumen claro y breve que explique la idea principal del texto, los datos que presenta, en qué se apoya el autor y sus conclusiones, con palabras sencillas y en el idioma de respuesta.
 
 6. **Puntos Clave y Argumentos Fundamentales**:
-   - Extrae entre 5 y 8 puntos clave esenciales que vertebren la argumentación lógica o el informe del texto/periódico.
+   - Extrae entre 5 y 8 puntos clave esenciales que expliquen lo esencial del texto, cada uno en una o dos frases sencillas.
 
 7. **Ejemplos numéricos explicativos (solo si el texto aporta cifras o magnitudes)**:
-   - Si el texto maneja cifras, costes, proporciones o plazos, traduce los conceptos técnicos a ejemplos numéricos claros y tangibles usando EXCLUSIVAMENTE datos presentes en el texto o cifras que conozcas con certeza (indica de dónde proceden). No inventes cifras para completar.
+   - Si el texto maneja cifras, costes, proporciones o plazos, explica los conceptos técnicos con ejemplos numéricos claros y fáciles de imaginar usando EXCLUSIVAMENTE datos presentes en el texto o cifras que conozcas con certeza (indica de dónde proceden). No inventes cifras para completar.
    - Si el texto no contiene cifras o no hay datos fiables, devuelve una lista vacía.
 
 8. **Resumen de Debates Actuales y Consensos Científicos/Académicos**:
-   - Elabora un análisis exhaustivo y didáctico del estado actual del debate intelectual, científico o técnico.
+   - Explica de forma clara y didáctica cómo está hoy el debate intelectual, científico o técnico.
    - Debes delimitar con total claridad:
      a) **overview**: Visión general del estado actual de la discusión.
      b) **keyQuestions**: Entre 3 y 5 preguntas o dilemas abiertos sobre los que aún se investiga o debate.
@@ -1111,13 +1120,14 @@ Instrucciones detalladas de análisis:
    - Cada posición debe apuntar a una afirmación CONCRETA del texto: copia en 'targetClaim' una frase LITERAL (máx. 25 palabras) del texto analizado. Si no puedes copiarla literalmente, no formules esa posición.
    - Antes de criticar, adopta la actitud de explorador: ¿qué acierta el autor?, ¿cuál es la versión más fuerte de su tesis? Critica esa versión fuerte, no una caricatura.
    - Indica en 'critiqueType' el tipo de crítica: definicion_perimetro (qué mide realmente una cifra, qué incluye y qué excluye, cómo se financia cada partida), medicion, causal, institucional_contable, empirica, logica o normativa.
+   - Redacta cada crítica con palabras sencillas: qué afirma el texto, por qué puede fallar y qué pruebas lo aclararían. Explica los conceptos técnicos con palabras corrientes (p. ej. «qué se cuenta y qué se deja fuera» en vez de «perímetro»).
    - Revisa siempre la validez conceptual de las cifras: perímetro y definición de la magnitud (qué agrega; si suma partidas de distinta naturaleza o de distinta fuente de financiación y si la conclusión depende de ello), numerador y denominador, valores nominales o reales, agregado o per cápita, fechas elegidas, y comparabilidad entre fuentes con definiciones distintas.
    - No afirmes como hecho algo institucional, contable o legal de lo que no estés seguro: formúlalo como pregunta o hipótesis a comprobar. En 'evidenceThatWouldSettleIt' indica qué dato o documento lo resolvería, y en 'suggestedSources' los nombres de las instituciones o bases de datos que lo publican (solo nombres, nunca enlaces inventados).
    - 'empiricalStudy' es OPCIONAL: inclúyelo solo si recuerdas con certeza un estudio real que trate específicamente ese argumento (título, autor y año exactos; DOI si lo conoces). Si no, OMÍTELO. Un estudio del mismo campo pero sobre otro asunto NO sirve. Se comprobará en registros académicos y se descartará si no existe o no trata el argumento.
    - Si la evidencia disponible no basta para sostener la crítica, dilo en 'scientificBasis' (evidencia insuficiente) en vez de forzar una justificación.
 
 10. **Debates Académicos e Intelectuales Vigentes**:
-   - Sitúa la tesis del artículo dentro del contexto histórico, escuelas de pensamiento rivales e implicaciones socioeconómicas o geopolíticas contemporáneas.
+   - Explica en qué debate encaja el texto: qué grupos de expertos piensan distinto, qué explicaciones compiten y qué consecuencias tiene hoy para la sociedad. Usa palabras sencillas.
 
 11. **Fuentes bibliográficas de contraste (opcional)**:
    - Incluye de 0 a 5 fuentes, solo las que conozcas con certeza y que traten específicamente los asuntos del texto. Si no hay literatura suficiente o no la recuerdas con certeza, devuelve la lista vacía: es una respuesta válida y preferible a inventar.
@@ -1127,17 +1137,17 @@ Instrucciones detalladas de análisis:
    - Indica en 'studyDesign' el diseño del estudio: systematic_review, rct, cohort, case_control, cross_sectional, case_series, expert_opinion, modeling_theory o unknown.
 
 12. **Glosario didáctico (solo los términos necesarios)**:
-   - Genera de 0 a 8 términos técnicos, metodológicos, económicos o filosóficos complejos que el lector necesite para entender el texto.
+   - Genera de 0 a 8 palabras o conceptos difíciles (técnicos, económicos, científicos o filosóficos) que el lector necesite para entender el texto.
    - Para cada término aporta:
      a) 'term': nombre exacto del concepto.
-     b) 'definition': definición accesible y rigurosa (nivel universitario sin jerga innecesaria).
+     b) 'definition': definición clara en una o dos frases, que entienda una persona de bachillerato y sin jerga innecesaria.
      c) 'simpleExample': un caso práctico. Si conoces con certeza un precedente real y verificable, cuéntalo con sus consecuencias medibles; si no, usa un ejemplo numérico hipotético y ETIQUÉTALO como "ejemplo ilustrativo (hipotético)". Nunca presentes como histórico algo que no sepas con certeza.
      d) 'scientificEvidenceOrSource' (OPCIONAL): cita bibliográfica solo si la conoces con certeza (autores, año exacto, título exacto y revista o institución). Si no, déjalo vacío: no inventes ni sustituyas por un trabajo parecido. Se comprobará en registros académicos.
      e) 'referenceUrl': déjalo vacío salvo que conozcas con certeza la URL exacta; el sistema generará un enlace de búsqueda.
 
 13. **Evaluación de explorador (scout)**:
    - 'whereAuthorIsRight': de 2 a 4 puntos donde el texto acierta o aporta valor.
-   - 'strongestVersion': la versión más sólida de la tesis del autor, en 1 a 3 frases.
+   - 'strongestVersion': la mejor versión de la idea principal del autor, en 1 a 3 frases sencillas.
    - 'implicationsIfTrue': de 2 a 4 implicaciones si la tesis fuera cierta.
    - 'whatWouldChangeTheConclusion': de 2 a 4 datos o evidencias concretas que cambiarían la conclusión.
    - 'evidenceSufficiency': suficiente, parcial o insuficiente respecto a lo que el texto afirma, con una nota breve en 'sufficiencyNote'. Concluir "insuficiente" es legítimo.
@@ -1148,7 +1158,7 @@ Instrucciones detalladas de análisis:
         userPrompt = `
 Has recibido ${imageList.length} fotografía(s) de un artículo de prensa, periódico, revista o documento impreso.
 Lee y transcribe minuciosamente el texto impreso, las cabeceras, subtítulos, pies de foto y los datos estadísticos visibles en la(s) foto(s).
-Lleva a cabo la deconstrucción crítica, traducción/transcripción íntegra al castellano, análisis epistemológico, fuentes bibliográficas solo si las conoces con certeza, y glosario pedagógico en castellano.
+Haz el análisis crítico, la traducción o transcripción completa al castellano, las fuentes solo si las conoces con certeza y un glosario sencillo en castellano. Escribe con palabras sencillas, para una persona de bachillerato.
 ${manualText ? `Notas o contexto adicional proporcionado por el usuario: "${manualText}"` : ""}
 `;
       } else {
@@ -1185,7 +1195,7 @@ ${textToAnalyze}
           },
           executiveSummary: { 
             type: Type.STRING, 
-            description: "Resumen ejecutivo formal, estructurado, pedagógico y claro (nivel universitario)." 
+            description: "Resumen claro y ordenado, con palabras sencillas (nivel de bachillerato)." 
           },
           keyPoints: { 
             type: Type.ARRAY, 
@@ -1250,22 +1260,22 @@ ${textToAnalyze}
           },
           academicDebates: {
             type: Type.STRING,
-            description: "Análisis exhaustivo y minucioso de los debates académicos e intelectuales vigentes sobre el tema."
+            description: "Explicación clara de los debates actuales entre expertos sobre el tema, con palabras sencillas."
           },
           glossary: {
             type: Type.ARRAY,
             items: {
               type: Type.OBJECT,
               properties: {
-                term: { type: Type.STRING, description: "Concepto o término técnico/filosófico/científico." },
-                definition: { type: Type.STRING, description: "Definición accesible, clara y didáctica (nivel universitario)." },
-                simpleExample: { type: Type.STRING, description: "Ejemplo o caso práctico sustancial, detallado y rigurosamente documentado (evita metáforas simplistas). Explica cómo opera en la práctica o qué ocurrió históricamente/empíricamente cuando se aplicó o ignoró este concepto en casos reales (p. ej. decisiones de bancos centrales, políticas públicas, experimentos científicos) y qué consecuencias medibles provocó." },
+                term: { type: Type.STRING, description: "Palabra o concepto difícil (técnico, científico o filosófico)." },
+                definition: { type: Type.STRING, description: "Definición clara y breve, que entienda una persona de bachillerato." },
+                simpleExample: { type: Type.STRING, description: "Ejemplo o caso práctico claro y fácil de entender, sin inventar datos. Explica cómo opera en la práctica o qué ocurrió históricamente/empíricamente cuando se aplicó o ignoró este concepto en casos reales (p. ej. decisiones de bancos centrales, políticas públicas, experimentos científicos) y qué consecuencias medibles provocó." },
                 scientificEvidenceOrSource: { type: Type.STRING, description: "Evidencia empírica contrastada, estudio seminal o documento institucional contrastado (autores, año, publicación/organismo) donde se verificó y probó este concepto en la realidad y dónde consultarlo." },
                 referenceUrl: { type: Type.STRING, description: "URL de referencia confiable o búsqueda educativa (e.g. Google Scholar, Wikipedia, Stanford Encyclopedia)." }
               },
               required: ["term", "definition", "simpleExample", "referenceUrl"]
             },
-            description: "Glosario didáctico de 4 a 8 conceptos complejos con ejemplos intuitivos y fuentes científicas contrastadas."
+            description: "Glosario de 4 a 8 palabras o conceptos difíciles, con ejemplos fáciles de entender y fuentes comprobadas."
           },
           bibliographicSources: {
             type: Type.ARRAY,
@@ -1502,10 +1512,10 @@ ${textToAnalyze}
     } catch (err: any) {
       if (err instanceof UnsafeUrlError) return res.status(400).json({ error: err.message });
       console.error("Error durante el análisis:", err);
-      let userErrMsg = err.message || "Error interno del servidor al analizar el contenido.";
+      let userErrMsg = err.message || "Ha ocurrido un error en el servidor al analizar el contenido.";
       
       if (userErrMsg.includes("429") || userErrMsg.includes("RESOURCE_EXHAUSTED") || userErrMsg.includes("rate-limits")) {
-        userErrMsg = "Se ha alcanzado temporalmente el límite de peticiones (Rate Limit / Quota) de Gemini API. La plataforma ha intentado recuperar la llamada automáticamente. Por favor, aguarda 30-60 segundos y vuelve a pulsar el botón de análisis.";
+        userErrMsg = "Google (Gemini) ha limitado las peticiones por un momento y la app ya lo ha intentado de nuevo sola. Espera 30 o 60 segundos y vuelve a pulsar el botón.";
       }
 
       res.status(500).json({ error: userErrMsg });
@@ -1554,15 +1564,15 @@ ${textToAnalyze}
         if (targetAnalysis) {
           targetText = `Título: ${targetAnalysis.title}\n\nResumen: ${targetAnalysis.executiveSummary}\n\nPuntos Clave:\n${targetAnalysis.keyPoints.join("\n")}\n\nDebates:\n${targetAnalysis.academicDebates || ""}`;
         } else {
-          return res.status(400).json({ error: "No se proporcionó suficiente texto original para traducir íntegramente." });
+          return res.status(400).json({ error: "No hay suficiente texto original para traducirlo." });
         }
       }
 
-      const systemInstruction = `Eres un traductor profesional, ensayista y catedrático universitario de máximo nivel. Tu única misión es generar una TRADUCCIÓN Y TRANSCRIPCIÓN ÍNTEGRA, COMPLETA, EXHAUSTIVA Y ESTRUCTURADA AL ESPAÑOL (CASTELLANO) de todo el contenido proporcionado.
+      const systemInstruction = `Eres un traductor profesional. Tu única misión es generar una TRADUCCIÓN Y TRANSCRIPCIÓN ÍNTEGRA, COMPLETA, EXHAUSTIVA Y ESTRUCTURADA AL ESPAÑOL (CASTELLANO) de todo el contenido proporcionado.
 REGLAS OBLIGATORIAS:
 1. TRADUCCIÓN 100% COMPLETA: Traduce párrafo por párrafo, sección por sección, instrucción por instrucción, sin omitir ningún párrafo ni resumir ni condensar.
 2. ESTRUCTURA IMPECABLE: Emplea formato Markdown elegante con subtítulos (##), párrafos bien separados, citas directas (>), listas y énfasis (negrita).
-3. PRECISIÓN TÉCNICA Y LINGÜÍSTICA: Conserva todos los nombres propios, cifras, fechas, terminología técnica y matices del autor original.
+3. PRECISIÓN TÉCNICA Y LINGÜÍSTICA: Conserva todos los nombres propios, cifras, fechas, terminología técnica y matices del autor original. Usa un castellano claro y natural, sin cambiar ni simplificar el contenido.
 4. PROHIBICIÓN DE ELIPSIS: Queda terminantemente prohibido truncar o colocar notas como "[continúa...]" o "[resumen del resto]". Traduce TODO el texto de principio a fin.`;
 
       const prompt = `Por favor, genera la traducción y transcripción exhaustiva e íntegra al castellano de este material:
@@ -1597,7 +1607,7 @@ ${targetText.substring(0, 45000)}`;
       const { id } = req.params;
       const analysis = db[id];
       if (!analysis) {
-        return res.status(404).json({ error: "Análisis no encontrado en la base de datos." });
+        return res.status(404).json({ error: "No se encuentra ese análisis." });
       }
 
       const outputLang = analysis.outputLanguage || detectLanguage(`${analysis.title} ${analysis.executiveSummary}`);
@@ -1687,11 +1697,11 @@ ${targetText.substring(0, 45000)}`;
       const { userCorrection, checkWithWeb, targetLanguage } = req.body;
       const analysis = db[id];
       if (!analysis) {
-        return res.status(404).json({ error: "Análisis no encontrado en la base de datos." });
+        return res.status(404).json({ error: "No se encuentra ese análisis." });
       }
 
       if (!userCorrection || userCorrection.trim().length < 2) {
-        return res.status(400).json({ error: "Debe indicar la corrección u observación a aplicar." });
+        return res.status(400).json({ error: "Escribe la corrección o la observación que quieres aplicar." });
       }
 
       const outputLang = targetLanguage || (detectLanguage(userCorrection) === "galego" ? "galego" : analysis.outputLanguage || "castellano");
@@ -1712,17 +1722,17 @@ Obtén todas las cifras exactas (escaños, votos, porcentajes, fechas histórica
         sources = searchRes.sources;
       }
 
-      const correctionSystemInstruction = `Eres un editor académico y de verificación de contenidos.
+      const correctionSystemInstruction = `Eres un editor que comprueba y corrige contenidos y los explica con palabras sencillas.
 El usuario ha señalado una corrección o dato inexacto en el informe. Tu tarea es integrar fielmente la corrección del usuario, complementarla con los datos fácticos verificados y rectificar el informe.
 
 ${isGal ? `
 *** OBRIGATORIO: LINGUA GALEGA ***
-Redacta o informe rectificado, o resumo executivo, os puntos clave e as explicacións estritamente en LINGUA GALEGA formal e impecable!
+Redacta o informe rectificado, o resumo executivo, os puntos clave e as explicacións estritamente en LINGUA GALEGA correcta, clara e sinxela!
 ` : isCat ? `
 *** OBLIGATORI: CATALÀ ***
-Redacta absolutament tot el text rectificat en català normatiu i formal.
+Redacta absolutament tot el text rectificat en català normatiu, clar i senzill.
 ` : `
-Redacta el informe rectificado en español (castellano) universitario.
+Redacta el informe rectificado en español (castellano) claro y sencillo, de nivel de bachillerato.
 `}
 `;
 
@@ -1817,7 +1827,7 @@ Genera la versión corregida y el resumen de cambios aplicados.
     const { id } = req.params;
     if (db[id]) return res.json(db[id]);
     if (Object.keys(db).length >= (Number(process.env.MAX_STORED_ANALYSES) || 500)) {
-      return res.status(507).json({ error: "Almacén lleno: borra análisis antiguos antes de restaurar más." });
+      return res.status(507).json({ error: "No queda espacio: borra análisis antiguos antes de guardar más." });
     }
     const a = req.body;
     const valid =
@@ -1825,7 +1835,7 @@ Genera la versión corregida y el resumen de cambios aplicados.
       typeof a.url === "string" && typeof a.title === "string" && typeof a.executiveSummary === "string" &&
       typeof a.analyzedAt === "string" && Array.isArray(a.keyPoints) && Array.isArray(a.categories) &&
       Array.isArray(a.bibliographicSources);
-    if (!valid) return res.status(400).json({ error: "Análisis no válido para restaurar." });
+    if (!valid) return res.status(400).json({ error: "No se puede recuperar ese análisis." });
     db[id] = a as AnalysisResult;
     saveDatabase(db);
     res.json(db[id]);
@@ -1835,7 +1845,7 @@ Genera la versión corregida y el resumen de cambios aplicados.
     const { id } = req.params;
     const analysis = db[id];
     if (!analysis) {
-      return res.status(404).json({ error: "Análisis no encontrado en la base de datos." });
+      return res.status(404).json({ error: "No se encuentra ese análisis." });
     }
 
     const { title, executiveSummary, keyPoints, numericalExamples, categories, outputLanguage } = req.body;
@@ -1866,9 +1876,9 @@ Genera la versión corregida y el resumen de cambios aplicados.
 
       console.log(`[Switch Language] Converting analysis "${analysis.title}" to ${langName}...`);
 
-      const systemInstruction = `Eres un traductor académico y catedrático universitario de alto nivel.
+      const systemInstruction = `Eres un traductor profesional.
 Tu tarea es traducir y adaptar fielmente TODO el análisis proporcionado al idioma ${langName}.
-Conserva rigurosamente todas las cifras, fechas, datos electorales, nombres de personas, conceptos y estructura universitaria.`;
+Conserva exactamente todas las cifras, fechas, datos electorales, nombres de personas y conceptos, y la misma estructura. Usa frases cortas y palabras sencillas (nivel de bachillerato) sin cambiar el contenido.`;
 
       const prompt = `Traduce y adapta íntegramente la siguiente estructura analítica al idioma ${langName}:
 
