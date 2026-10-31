@@ -37,7 +37,7 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
   const provided = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
   // comparación en tiempo constante sobre hashes de longitud fija
   const ok = provided.length > 0 && crypto.timingSafeEqual(sha256(provided), sha256(expected));
-  if (!ok) return res.status(401).json({ error: "No autorizado: falta o es incorrecta la clave de acceso." });
+  if (!ok) return res.status(401).json({ error: "No tienes permiso: falta la clave de acceso o es incorrecta." });
   next();
 }
 
@@ -51,7 +51,7 @@ export const failedAuthLimiter = rateLimit({
   limit: intEnv("RL_FAILED_AUTH_MAX", 20),
   skipSuccessfulRequests: true,
   requestWasSuccessful: (_req: Request, res: Response) => res.statusCode !== 401,
-  message: { error: "Demasiados intentos fallidos. Espera 15 minutos." },
+  message: { error: "Has fallado demasiadas veces. Espera 15 minutos." },
 });
 
 export const apiLimiter = rateLimit({
@@ -66,7 +66,7 @@ export const costlyLimiter = rateLimit({
   ...common,
   windowMs: 60 * 60 * 1000,
   limit: intEnv("RL_COSTLY_MAX", 15),
-  message: { error: "Límite horario de análisis alcanzado. Inténtalo más tarde." },
+  message: { error: "Has llegado al máximo de análisis por hora. Inténtalo más tarde." },
 });
 
 /**
@@ -84,7 +84,7 @@ export function dailyCostlyCap(_req: Request, res: Response, next: NextFunction)
     capCount = 0;
   }
   if (capCount >= dailyCostlyMax()) {
-    return res.status(429).json({ error: `Límite diario global de análisis alcanzado (${dailyCostlyMax()}). Vuelve a intentarlo mañana.` });
+    return res.status(429).json({ error: `Se ha llegado al máximo de análisis de hoy (${dailyCostlyMax()}). Inténtalo mañana.` });
   }
   capCount++;
   next();
@@ -111,14 +111,14 @@ const ALLOWED_MIME = [/^application\/pdf$/, /^application\/msword$/, /^applicati
 const ALLOWED_EXT = /\.(pdf|docx?|jpe?g|png|webp|gif)$/i;
 
 function checkDataString(data: unknown, name?: string, type?: string) {
-  if (typeof data !== "string" || data.length === 0) throw new HttpError(400, "Fichero no válido.");
+  if (typeof data !== "string" || data.length === 0) throw new HttpError(400, "Archivo no válido.");
   const m = data.match(/^data:([^;,]+)[^,]*;base64,/);
   const mime = (m ? m[1] : type || "").toLowerCase();
   const mimeOk = ALLOWED_MIME.some((re) => re.test(mime));
   const extOk = typeof name === "string" && ALLOWED_EXT.test(name);
-  if (!mimeOk && !extOk) throw new HttpError(400, "Tipo de fichero no admitido (PDF, Word o imagen).");
+  if (!mimeOk && !extOk) throw new HttpError(400, "Ese tipo de archivo no se admite. Sube un PDF, un Word o una imagen.");
   const approxBytes = Math.floor((data.length * 3) / 4);
-  if (approxBytes > MAX_FILE_MB * 1024 * 1024) throw new HttpError(400, `Un fichero supera el límite de ${MAX_FILE_MB} MB.`);
+  if (approxBytes > MAX_FILE_MB * 1024 * 1024) throw new HttpError(400, `Un archivo pesa más de ${MAX_FILE_MB} MB.`);
 }
 
 /** Valida el cuerpo de POST /api/analyze. Lanza HttpError(400) si algo no cuadra. */
@@ -134,7 +134,7 @@ export function validateAnalyzeBody(body: any): void {
   }
   if (manualText !== undefined && manualText !== null) {
     if (typeof manualText !== "string") throw new HttpError(400, "El texto manual debe ser una cadena.");
-    if (manualText.length > MAX_TEXT_CHARS) throw new HttpError(400, `El texto supera ${MAX_TEXT_CHARS} caracteres.`);
+    if (manualText.length > MAX_TEXT_CHARS) throw new HttpError(400, `El texto es demasiado largo (máximo ${MAX_TEXT_CHARS} caracteres).`);
   }
   if (contentType !== undefined && contentType !== null && !CONTENT_TYPES.has(contentType)) {
     throw new HttpError(400, "Tipo de contenido no válido.");
@@ -145,7 +145,7 @@ export function validateAnalyzeBody(body: any): void {
     for (const f of files) {
       if (typeof f === "string") checkDataString(f);
       else if (f && typeof f === "object") checkDataString(f.data, f.name, f.type);
-      else throw new HttpError(400, "Fichero no válido.");
+      else throw new HttpError(400, "Archivo no válido.");
       count++;
     }
   }
@@ -160,5 +160,5 @@ export function validateAnalyzeBody(body: any): void {
     checkDataString(image, undefined, "image/jpeg");
     count++;
   }
-  if (count > MAX_FILES) throw new HttpError(400, `Máximo ${MAX_FILES} ficheros por análisis.`);
+  if (count > MAX_FILES) throw new HttpError(400, `Máximo ${MAX_FILES} archivos por análisis.`);
 }

@@ -142,7 +142,7 @@ Reglas:
 - Marca como "opinion" los juicios de valor y como "prediction" lo que se refiere al futuro; no los conviertas en hechos.
 - "quote" debe ser copia LITERAL del texto. Si no puedes copiarla literalmente, déjala vacía antes que parafrasear.
 - "neutralQuestion" no debe contener la respuesta del autor (p. ej. no "¿Ganó Hassabis el Nobel de Medicina?", sino "¿Qué premio Nobel recibió Demis Hassabis y en qué año?").
-- Escribe "claim" y "neutralQuestion" en ${lang}.
+- Escribe "claim" y "neutralQuestion" en ${lang}, con frases cortas y palabras sencillas (nivel de bachillerato).
 - Si el texto no contiene afirmaciones comprobables, devuelve una lista vacía.`;
   const prompt = `Texto a analizar:\n"""\n${text}\n"""\n\nDevuelve las afirmaciones verificables en el JSON indicado.`;
   const parsed = parseJson(await deps.llmJson(prompt, system, extractionSchema));
@@ -289,7 +289,7 @@ Reglas (el mismo rasero para todas las afirmaciones, coincidan o no con la evide
 - Usa solo el texto de evidencia dado, no tu memoria.
 - Confianza calibrada: 0.9-1.0 solo con evidencia explícita, precisa y de fuentes autorizadas; 0.7-0.89 evidencia clara; 0.4-0.69 indirecta o parcial; menos de 0.4 débil. No infles.
 - "evidenceQuote" debe ser copia literal y corta (máx. 25 palabras) del texto de evidencia, o vacío.
-- Redacta "explanation" y "correction" en ${lang}.`;
+- Redacta "explanation" y "correction" en ${lang}, con frases cortas y palabras sencillas (nivel de bachillerato): di en una o dos frases por qué la afirmación es cierta, falsa o dudosa.`;
   const body = items
     .map((it) => `ID: ${it.id}\nAFIRMACIÓN: ${it.claim}\nFUENTES REALES RECUPERADAS: ${it.nSources}\nEVIDENCIA:\n${it.evidence || "(vacía)"}`)
     .join("\n\n=====\n\n");
@@ -311,7 +311,7 @@ export function applyGuards(args: {
 
   // Sin fuentes reales no hay veredicto, diga lo que diga el LLM.
   if (args.nSources === 0) {
-    if (verdict !== "insufficient_evidence") note = "El buscador no devolvió fuentes reales; veredicto del modelo descartado.";
+    if (verdict !== "insufficient_evidence") note = "El buscador no encontró fuentes reales, así que se descarta el veredicto de la IA.";
     return { verdict: "insufficient_evidence", confidence: Math.min(confidence, 0.3), note };
   }
   // Una sola fuente nunca justifica confianza alta.
@@ -319,7 +319,7 @@ export function applyGuards(args: {
 
   // Mismo umbral en ambas direcciones: ni respaldar ni contradecir con confianza baja.
   if ((verdict === "supported" || verdict === "contradicted") && confidence < 0.5) {
-    return { verdict: "insufficient_evidence", confidence, note: "Confianza insuficiente para respaldar o contradecir." };
+    return { verdict: "insufficient_evidence", confidence, note: "No hay seguridad suficiente para decir que es cierta o falsa." };
   }
   return { verdict, confidence, note };
 }
@@ -327,24 +327,24 @@ export function applyGuards(args: {
 // ── 5. dictamen por plantilla ────────────────────────────────────────────────
 const T: Record<string, Record<string, string>> = {
   castellano: {
-    title: "Informe de contraste afirmación por afirmación",
-    head: "Se extrajeron {extracted} afirmaciones del texto; se revisaron {considered}. {searched} eran comprobables como hechos y {nc} no (opiniones o predicciones).",
-    result: "Resultado: {s} respaldadas, {p} parcialmente respaldadas, {c} contradichas, {i} sin evidencia suficiente.",
-    contradicted: "Afirmaciones contradichas por las fuentes:",
-    partial: "Afirmaciones solo parcialmente respaldadas:",
-    none: "Ninguna afirmación revisada fue contradicha por las fuentes encontradas.",
-    summaryOnly: "AVISO: no había texto original guardado; se auditó el resumen generado, no el artículo.",
-    truncated: "AVISO: el texto era muy largo y solo se auditó su primera parte.",
-    limits: "Límites: se revisan como máximo {max} afirmaciones por informe y la evidencia procede de una búsqueda automática. Que no se señale un error no garantiza que no exista; conviene revisar las fuentes enlazadas.",
-    noClaims: "No se encontraron afirmaciones comprobables en el texto.",
-    failExplain: "Falló la búsqueda de evidencia ({err}). Esto no significa que no exista evidencia: vuelve a intentarlo más tarde.",
-    failNote: "AVISO: la búsqueda de evidencia falló por un error técnico en {f} de {n} afirmaciones comprobables; ese resultado NO indica ausencia de evidencia. Vuelve a intentarlo más tarde.",
-    failedCount: "{f} sin comprobar por fallo de búsqueda.",
-    claimsReused: "Se han reutilizado las mismas afirmaciones de la auditoría anterior para que los resultados sean comparables; solo se ha repetido la comprobación de la evidencia.",
-    quotaDay: "CUOTA DIARIA DE GEMINI AGOTADA: Google limita las peticiones por proyecto y por día, y se reinicia a medianoche (hora del Pacífico). No se han gastado más peticiones en este informe. Vuelve a auditar después o consulta el panel de límites de AI Studio.",
+    title: "Informe: comprobación afirmación por afirmación",
+    head: "Se encontraron {extracted} afirmaciones en el texto y se revisaron {considered}. {searched} se podían comprobar como hechos y {nc} no (son opiniones o predicciones).",
+    result: "Resultado: {s} apoyadas, {p} apoyadas solo en parte, {c} contradichas, {i} sin pruebas suficientes.",
+    contradicted: "Afirmaciones que las fuentes contradicen:",
+    partial: "Afirmaciones que las fuentes apoyan solo en parte:",
+    none: "Ninguna afirmación revisada ha sido contradicha por las fuentes encontradas.",
+    summaryOnly: "AVISO: no había texto original guardado; se revisó el resumen, no el artículo.",
+    truncated: "AVISO: el texto era muy largo y solo se revisó la primera parte.",
+    limits: "Límites: se revisan como máximo {max} afirmaciones por informe y las pruebas vienen de una búsqueda automática. Que no se señale un error no garantiza que no exista; conviene mirar las fuentes enlazadas.",
+    noClaims: "No se encontraron en el texto afirmaciones que se puedan comprobar.",
+    failExplain: "La búsqueda de pruebas falló ({err}). Eso no significa que no haya pruebas: inténtalo más tarde.",
+    failNote: "AVISO: la búsqueda de pruebas falló por un error técnico en {f} de {n} afirmaciones; ese resultado NO significa que no haya pruebas. Inténtalo más tarde.",
+    failedCount: "{f} sin comprobar porque falló la búsqueda.",
+    claimsReused: "Se han usado las mismas afirmaciones de la comprobación anterior para poder comparar los resultados; solo se ha repetido la búsqueda de pruebas.",
+    quotaDay: "SE HA AGOTADO EL LÍMITE DIARIO DE GEMINI: Google limita las peticiones por proyecto y por día, y se reinicia a medianoche (hora del Pacífico). No se han gastado más peticiones en este informe. Vuelve a comprobar más tarde o mira el panel de límites de AI Studio.",
   },
   galego: {
-    title: "Informe de contraste afirmación por afirmación",
+    title: "Informe: comprobación afirmación por afirmación",
     head: "Extraéronse {extracted} afirmacións do texto; revisáronse {considered}. {searched} eran comprobables como feitos e {nc} non (opinións ou predicións).",
     result: "Resultado: {s} avaladas, {p} parcialmente avaladas, {c} contraditas, {i} sen evidencia suficiente.",
     contradicted: "Afirmacións contraditas polas fontes:",
@@ -508,7 +508,7 @@ export async function runClaimAudit(deps: AuditDeps, input: AuditInput, opts: {
         ...base,
         verdict: "not_checkable" as ClaimVerdict,
         confidence: 0,
-        explanation: c.claimType === "opinion" ? "Juicio de valor: no es comprobable como hecho." : "Predicción: no es comprobable como hecho presente.",
+        explanation: c.claimType === "opinion" ? "Es una opinión: no se puede comprobar como un hecho." : "Es una predicción: todavía no se puede comprobar.",
         evidence: [],
       };
     }
@@ -530,7 +530,7 @@ export async function runClaimAudit(deps: AuditDeps, input: AuditInput, opts: {
 
     const evidenceQuote = j && typeof j.evidenceQuote === "string" && words(j.evidenceQuote).length <= 25 && locateFragment(j.evidenceQuote, ev.text) ? j.evidenceQuote.trim() : undefined;
     const correction = g.verdict === "contradicted" || g.verdict === "partially_supported" ? clip(j?.correction, 500) || undefined : undefined;
-    const explanation = [g.note, clip(j?.explanation, 600)].filter(Boolean).join(" ") || "Sin evidencia suficiente para pronunciarse.";
+    const explanation = [g.note, clip(j?.explanation, 600)].filter(Boolean).join(" ") || "No hay pruebas suficientes para decidir.";
     // dedup por URL, máx. 4
     const seen = new Set<string>();
     const evidence = ev.sources.filter((s) => (seen.has(s.url) ? false : (seen.add(s.url), true))).slice(0, 4);

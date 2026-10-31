@@ -182,11 +182,11 @@ export async function verifyInstitutionalPage(claim: CitationClaim, fetchPage: P
     return { status: "not_found", notes: ["La URL indicada no es válida."] };
   }
   const page = await fetchPage(claim.url);
-  if (!page || !page.ok) return { status: "not_found", notes: ["No se pudo abrir la página indicada para comprobar la cita."] };
+  if (!page || !page.ok) return { status: "not_found", notes: ["No se pudo abrir la página para comprobar la cita."] };
   const meta = parseHtmlMeta(page.html);
   const best = meta.titles.map((t) => ({ t, sim: pageTitleSimilarity(claim.title, t) })).sort((x, y) => y.sim - x.sim)[0];
   if (!best || best.sim < 0.9) {
-    return { status: "not_found", notes: ["La página indicada no contiene el título citado; se descarta."], titleSimilarity: best?.sim };
+    return { status: "not_found", notes: ["La página no contiene el título citado; se descarta."], titleSimilarity: best?.sim };
   }
   let finalHost = host;
   try { finalHost = new URL(page.finalUrl).hostname; } catch { /* usar el original */ }
@@ -203,7 +203,7 @@ export async function verifyInstitutionalPage(claim: CitationClaim, fetchPage: P
     status: "probable", // existe y el título coincide, pero sin DOI ni registro bibliográfico: nunca "exact"
     record,
     titleSimilarity: best.sim,
-    notes: [`Localizada en la web de ${finalHost}: el título coincide. Sin DOI ni indexación en Crossref/OpenAlex.${record.institutional ? " Dominio institucional reconocido." : ""}`],
+    notes: [`Encontrada en la web de ${finalHost}: el título coincide. No tiene DOI ni aparece en Crossref/OpenAlex.${record.institutional ? " Es la web de un organismo oficial." : ""}`],
   };
 }
 
@@ -383,9 +383,9 @@ export async function verifyCitation(reg: Registry, claim: CitationClaim, fetchP
     if (d.status === "exact" || d.status === "probable") {
       return { status: d.status, record: await enrich(reg, rec), titleSimilarity: d.sim, surname: d.surname, yearDelta: d.yearDelta, notes };
     }
-    notes.push(`Obra más parecida: «${rec.title.slice(0, 90)}» (similitud ${best.sim.toFixed(2)}); no coincide lo bastante en autor o año.`);
+    notes.push(`Estudio más parecido: «${rec.title.slice(0, 90)}» (parecido ${best.sim.toFixed(2)}); el autor o el año no coinciden lo bastante.`);
   } else if (best) {
-    notes.push(`Ninguna obra del registro coincide con el título citado (la más parecida tiene similitud ${best.sim.toFixed(2)}).`);
+    notes.push(`Ningún estudio del registro coincide con el título citado (el más parecido tiene un parecido de ${best.sim.toFixed(2)}).`);
   } else {
     notes.push("El registro no devolvió resultados para esta cita.");
   }
@@ -479,29 +479,29 @@ export interface Reliability {
 
 export function scoreReliability(rec: RegistryRecord | undefined, status: VerificationStatus, design: StudyDesign = "unknown"): Reliability {
   if (!rec || (status !== "exact" && status !== "probable")) {
-    return { score: null, basis: ["No evaluable: la obra no está verificada en un registro."] };
+    return { score: null, basis: ["No se puede puntuar: la obra no está comprobada en ningún registro."] };
   }
-  if (rec.isRetracted) return { score: 0, basis: ["La obra figura como RETRACTADA."] };
+  if (rec.isRetracted) return { score: 0, basis: ["El estudio ha sido retirado por la revista (retractado)."] };
   const basis: string[] = ["Obra localizada y coincidente en registro (+10)"];
   let score = 10;
   const t = (rec.type || "").toLowerCase();
   let venuePts = 10;
   let venueTxt = "tipo de publicación no determinado (+10)";
   if (/journal-article|^article$/.test(t) && rec.venue) { venuePts = 30; venueTxt = `artículo de revista (${rec.venue}) (+30)`; }
-  else if (/report/.test(t) && rec.institutional) { venuePts = 25; venueTxt = "informe de un organismo oficial (dominio institucional reconocido) (+25)"; }
+  else if (/report/.test(t) && rec.institutional) { venuePts = 25; venueTxt = "informe de un organismo oficial (+25)"; }
   else if (/book|monograph|report|chapter|proceedings/.test(t)) { venuePts = 20; venueTxt = "libro, informe o actas (+20)"; }
-  else if (/preprint|posted-content/.test(t)) { venuePts = 10; venueTxt = "preprint, sin revisión por pares confirmada (+10)"; }
+  else if (/preprint|posted-content/.test(t)) { venuePts = 10; venueTxt = "estudio aún sin publicar en revista (preprint) o sin revisión de expertos confirmada (+10)"; }
   score += venuePts;
   basis.push(venueTxt);
   const cit = rec.citedBy ?? 0;
   const citPts = Math.min(25, Math.round(6 * Math.log10(1 + cit)));
   score += citPts;
-  basis.push(`${cit} citas registradas (+${citPts}; no se ajusta por antigüedad)`);
+  basis.push(`citado ${cit} veces (+${citPts}; no se tiene en cuenta la antigüedad)`);
   const dPts = DESIGN_POINTS[design] ?? 10;
   score += dPts;
-  basis.push(design === "unknown" ? "diseño del estudio no determinado (+10)" : `diseño declarado por el modelo: ${design.replace("_", " ")} (+${dPts}; no verificado)`);
+  basis.push(design === "unknown" ? "diseño del estudio no determinado (+10)" : `tipo de estudio según la IA: ${design.replace("_", " ")} (+${dPts}; sin comprobar)`);
   basis.push("Replicación: no evaluada. Riesgo de sesgo, tamaño muestral y conflictos de interés: no evaluados.");
-  if (rec.hasConcern) { score = Math.max(0, score - 15); basis.push("Tiene una expresión de preocupación editorial (-15)"); }
+  if (rec.hasConcern) { score = Math.max(0, score - 15); basis.push("La revista ha publicado un aviso de preocupación sobre el estudio (-15)"); }
   return { score: Math.max(0, Math.min(100, score)), basis };
 }
 
@@ -552,7 +552,7 @@ export async function resolveCitations(reg: Registry, llmJson: LlmJson, inputs: 
     const out: CitationOutput = { id: inp.id, status: v.status, record: v.record, support: s.verdict, supportQuote: s.quote, notes: [...v.notes] };
     if (v.record?.isRetracted) {
       out.support = "unassessed";
-      out.notes.push("La obra figura como retractada: no se usa como evidencia.");
+      out.notes.push("El estudio fue retirado por la revista: no se usa como prueba.");
       if (inp.dropIfUnrelated) {
         out.discarded = { title: v.record.title, reason: "retractada" };
         out.record = undefined;
@@ -588,7 +588,7 @@ export async function resolveCitations(reg: Registry, llmJson: LlmJson, inputs: 
             record: list[i],
             support: s.verdict,
             supportQuote: s.quote,
-            notes: [...prev.notes, "Lectura relacionada sugerida por búsqueda automática; no es una fuente verificada de esta afirmación."],
+            notes: [...prev.notes, "Lectura relacionada que sugirió una búsqueda automática; no está comprobado que apoye esta afirmación."],
           });
           break;
         }
