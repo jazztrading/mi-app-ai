@@ -231,7 +231,7 @@ test("disyuntor: con la cuota DIARIA agotada no se lanzan más búsquedas ni seg
   assert.ok(searches <= 2, `se hicieron ${searches} búsquedas (máx. = concurrencia 2)`);
   assert.equal(out.coverage.quota, "day");
   assert.equal(out.coverage.searchFailed, 8);
-  assert.match(out.summaryAudit, /CUOTA DIARIA DE GEMINI AGOTADA/);
+  assert.match(out.summaryAudit, /LÍMITE DIARIO DE GEMINI/);
   assert.match(out.claimChecks[7].explanation, /límite diario/);
 });
 
@@ -261,6 +261,6 @@ test("ESTABILIDAD: con las afirmaciones congeladas no se vuelve a extraer y se a
   assert.deepEqual(second.claimChecks.map((c) => c.verdict), first.claimChecks.map((c) => c.verdict));
   assert.equal(second.coverage.claimsReused, true);
   assert.equal(second.coverage.extracted, first.coverage.extracted);
-  assert.match(second.summaryAudit, /mismas afirmaciones de la auditoría anterior/);
+  assert.match(second.summaryAudit, /mismas afirmaciones de la comprobación anterior/);
   assert.equal(first.coverage.claimsReused, undefined);
 });

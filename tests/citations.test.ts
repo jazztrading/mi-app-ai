@@ -103,7 +103,7 @@ test("related_unverified: solo con OpenAlex, con respaldo+frase literal, y NUNCA
   const out = await resolveCitations(reg, l, [{ id: "p", claim: CLAIM, cited: undefined, relatedQuery: "pension sustainability intergenerational", dropIfUnrelated: true }]);
   assert.equal(out[0].status, "related_unverified");
   assert.equal(out[0].record?.title, rel.title);
-  assert.match(out[0].notes.join(" "), /no es una fuente verificada/);
+  assert.match(out[0].notes.join(" "), /no está comprobado que apoye esta afirmación/);
   // sin OpenAlex no se inventa nada
   const none = await resolveCitations(fakeRegistry({ oa: false }), l, [{ id: "p", claim: CLAIM, relatedQuery: "x", dropIfUnrelated: true }]);
   assert.equal(none[0].record, undefined);
