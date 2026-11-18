@@ -171,7 +171,10 @@ test("fallo técnico de la búsqueda: no se confunde con falta de evidencia ni s
   assert.match(out.summaryAudit, /falló por un error técnico en 2 de 2/);
   assert.doesNotMatch(out.summaryAudit, /Ninguna afirmación revisada fue contradicha/);
   assert.doesNotMatch(JSON.stringify(out), /AIzaSy/, "la clave nunca se filtra al informe");
-  assert.match(out.claimChecks[0].explanation, /Quota exceeded/);
+  // un 429 sin detalle se trata como cuota agotada: se corta, no se reintenta y el mensaje es claro (sin el texto técnico en inglés)
+  assert.equal(out.coverage.quota, "other");
+  assert.match(out.claimChecks[0].explanation, /límite de uso de Gemini/);
+  assert.match(out.summaryAudit, /LÍMITE DE USO DE GEMINI/);
 });
 
 test("si la búsqueda falla la primera vez y funciona en el reintento, la afirmación se evalúa con normalidad", async () => {
@@ -182,7 +185,7 @@ test("si la búsqueda falla la primera vez y funciona en el reintento, la afirma
     groundedSearch: async (prompt) => {
       const k = prompt.includes("Hassabis") ? "nobel" : "otra";
       calls[k] = (calls[k] || 0) + 1;
-      if (k === "nobel" && calls[k] === 1) return { text: "", sources: [], failed: true, error: "429" };
+      if (k === "nobel" && calls[k] === 1) return { text: "", sources: [], failed: true, error: "503 service unavailable" };
       return base.groundedSearch(prompt);
     },
   };
@@ -232,7 +235,7 @@ test("disyuntor: con la cuota DIARIA agotada no se lanzan más búsquedas ni seg
   assert.equal(out.coverage.quota, "day");
   assert.equal(out.coverage.searchFailed, 8);
   assert.match(out.summaryAudit, /LÍMITE DIARIO DE GEMINI/);
-  assert.match(out.claimChecks[7].explanation, /límite diario/);
+  assert.match(out.claimChecks[7].explanation, /límite de uso de Gemini/);
 });
 
 test("cuota por minuto: se espera y se reintenta, y la afirmación acaba evaluada", async () => {
