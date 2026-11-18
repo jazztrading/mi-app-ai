@@ -1192,6 +1192,9 @@ export default function App() {
                       />
                       <Link className="absolute left-3 top-2.5 w-4 h-4 text-slate-400" />
                     </div>
+                    <p className="mt-1.5 text-[11px] leading-snug text-slate-500">
+                      Si una web bloquea la lectura, pega la dirección directa del audio (acaba en .mp3 o .m4a) o el texto en «Pegar texto».
+                    </p>
                   </div>
 
                   <div>
