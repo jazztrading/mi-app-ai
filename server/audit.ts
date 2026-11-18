@@ -11,6 +11,7 @@
 //  4. Reglas deterministas (código, no LLM) que impiden sellos sin fuentes reales y confianza inflada.
 //  5. El dictamen se construye por plantilla a partir de los recuentos, nunca con prosa libre del LLM.
 import { Type } from "@google/genai";
+import { chunkArray } from "./grounding";
 
 export type ClaimVerdict = "supported" | "contradicted" | "partially_supported" | "insufficient_evidence" | "not_checkable";
 export type ClaimType = "fact" | "quantitative" | "attribution" | "prediction" | "opinion";
@@ -35,6 +36,12 @@ export interface ClaimCheck {
 export interface AuditDeps {
   llmJson: (prompt: string, system: string, schema: any) => Promise<string>;
   groundedSearch: (prompt: string) => Promise<{ text: string; sources: Array<{ title: string; url: string }>; failed?: boolean; error?: string }>;
+  /** Búsqueda agrupada: una sola petición para varias afirmaciones. Si existe, se usa en lugar de groundedSearch. */
+  groundedSearchBatch?: (items: Array<{ id: string; question: string }>) => Promise<{
+    results: Record<string, { text: string; sources: Array<{ title: string; url: string }> }>;
+    failed?: boolean;
+    error?: string;
+  }>;
 }
 
 export interface AuditInput {
@@ -48,7 +55,7 @@ export interface AuditInput {
 export interface AuditOutcome {
   claimChecks: ClaimCheck[];
   counts: Record<ClaimVerdict, number>;
-  coverage: { extracted: number; considered: number; searched: number; notCheckable: number; textTruncated: boolean; maxClaims: number; searchFailed: number; quota?: "day" | "minute"; claimsReused?: boolean };
+  coverage: { extracted: number; considered: number; searched: number; notCheckable: number; textTruncated: boolean; maxClaims: number; searchFailed: number; quota?: "day" | "minute" | "other"; claimsReused?: boolean };
   auditedFrom: "original_text" | "summary_only";
   status: "verified" | "corrected" | "inconclusive";
   summaryAudit: string;
@@ -57,8 +64,11 @@ export interface AuditOutcome {
   strongCorrections: string[];
 }
 
-export const AUDIT_MAX_CLAIMS = Math.max(1, Number(process.env.AUDIT_MAX_CLAIMS) || 10);
+export const AUDIT_MAX_CLAIMS = Math.max(1, Number(process.env.AUDIT_MAX_CLAIMS) || 8);
 export const AUDIT_CONCURRENCY = 2;
+/** Afirmaciones por petición de búsqueda. 1 = una petición por afirmación (comportamiento antiguo). */
+export const AUDIT_BATCH_SIZE = Math.max(1, Number(process.env.AUDIT_BATCH_SIZE) || 4);
+const EVIDENCE_TTL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_RETRY_DELAY_MS = 4000;
 export const AUDIT_TEXT_CAP = 60_000;
 const MIN_SOURCE_TEXT = 200;
@@ -223,13 +233,43 @@ export function sanitizeError(raw: any): string {
   return (extra.length ? `${msg} [${extra.join(" · ")}]` : msg).slice(0, 320) || "error desconocido";
 }
 
-interface Evidence {
+export interface Evidence {
   text: string;
   sources: Array<{ title: string; url: string }>;
   failed: boolean;
   error?: string;
   quota?: "day" | "minute" | "other";
   retryAfterSec?: number;
+}
+
+/** Memoria de evidencia ya recuperada (24 h): volver a comprobar no repite las búsquedas que ya funcionaron. */
+export type EvidenceCache = Map<string, { at: number; ev: Evidence }>;
+export const createEvidenceCache = (): EvidenceCache => new Map();
+
+function failedEvidence(raw: any): Evidence {
+  const info = parseGeminiError(raw);
+  return { text: "", sources: [], failed: true, error: sanitizeError(raw), quota: info.quota, retryAfterSec: info.retryAfterSec };
+}
+
+async function searchBatch(deps: AuditDeps, group: Array<{ id: string; neutralQuestion: string; claim: string }>): Promise<Map<string, Evidence>> {
+  const out = new Map<string, Evidence>();
+  try {
+    const r = await deps.groundedSearchBatch!(group.map((c) => ({ id: c.id, question: c.neutralQuestion || c.claim })));
+    if (r.failed) {
+      const ev = failedEvidence(r.error || "el buscador no respondió");
+      for (const c of group) out.set(c.id, { ...ev });
+      return out;
+    }
+    for (const c of group) {
+      const one = r.results?.[c.id];
+      const text = (one?.text || "").slice(0, 2500);
+      out.set(c.id, text.trim() ? { text, sources: one?.sources || [], failed: false } : { text: "", sources: [], failed: true, error: "el buscador no devolvió respuesta para esta afirmación" });
+    }
+  } catch (e: any) {
+    const ev = failedEvidence(e);
+    for (const c of group) out.set(c.id, { ...ev });
+  }
+  return out;
 }
 
 async function searchEvidence(deps: AuditDeps, question: string): Promise<Evidence> {
@@ -339,6 +379,8 @@ const T: Record<string, Record<string, string>> = {
     noClaims: "No se encontraron en el texto afirmaciones que se puedan comprobar.",
     failExplain: "La búsqueda de pruebas falló ({err}). Eso no significa que no haya pruebas: inténtalo más tarde.",
     failNote: "AVISO: la búsqueda de pruebas falló por un error técnico en {f} de {n} afirmaciones; ese resultado NO significa que no haya pruebas. Inténtalo más tarde.",
+    failQuota: "Sin comprobar: se agotó el límite de uso de Gemini. Eso no significa que no haya pruebas.",
+    quotaOther: "SE HA AGOTADO EL LÍMITE DE USO DE GEMINI (cuota). Con la cuenta gratuita hay muy pocas peticiones al día, y se reinician sobre las 9:00 (hora de España). La app ha parado las búsquedas para no gastar más. Lo que ya se comprobó se guarda: al pulsar «Volver a comprobar» solo se repetirán las que fallaron. Para que no pase, activa la facturación en Google AI Studio o baja el número de afirmaciones por informe.",
     failedCount: "{f} sin comprobar porque falló la búsqueda.",
     claimsReused: "Se han usado las mismas afirmaciones de la comprobación anterior para poder comparar los resultados; solo se ha repetido la búsqueda de pruebas.",
     quotaDay: "SE HA AGOTADO EL LÍMITE DIARIO DE GEMINI: Google limita las peticiones por proyecto y por día, y se reinicia a medianoche (hora del Pacífico). No se han gastado más peticiones en este informe. Vuelve a comprobar más tarde o mira el panel de límites de AI Studio.",
@@ -356,6 +398,8 @@ const T: Record<string, Record<string, string>> = {
     noClaims: "Non se atoparon afirmacións comprobables no texto.",
     failExplain: "Fallou a busca de evidencia ({err}). Isto non significa que non exista evidencia: volve tentalo máis tarde.",
     failNote: "AVISO: a busca de evidencia fallou por un erro técnico en {f} de {n} afirmacións comprobables; ese resultado NON indica ausencia de evidencia. Volve tentalo máis tarde.",
+    failQuota: "Sen comprobar: esgotouse o límite de uso de Gemini. Isto non significa que non haxa probas.",
+    quotaOther: "ESGOTOUSE O LÍMITE DE USO DE GEMINI (cota). Coa conta gratuíta hai moi poucas peticións ao día, e reiníciase sobre as 9:00 (hora de España). A app parou a busca para non gastar máis. O que xa se comprobou gárdase: ao premer «Volver a comprobar» só se repetirán as que fallaron.",
     failedCount: "{f} sen comprobar por fallo de busca.",
     claimsReused: "Reutilizáronse as mesmas afirmacións da auditoría anterior para que os resultados sexan comparables; só se repetiu a comprobación da evidencia.",
     quotaDay: "CUOTA DIARIA DE GEMINI ESGOTADA: Google limita as peticións por proxecto e por día, e reiníciase á medianoite (hora do Pacífico). Non se gastaron máis peticións neste informe. Volve auditar despois ou consulta o panel de límites de AI Studio.",
@@ -373,6 +417,8 @@ const T: Record<string, Record<string, string>> = {
     noClaims: "No s'han trobat afirmacions comprovables al text.",
     failExplain: "Ha fallat la cerca d'evidència ({err}). Això no vol dir que no n'hi hagi: torna-ho a provar més tard.",
     failNote: "AVÍS: la cerca d'evidència ha fallat per un error tècnic en {f} de {n} afirmacions comprovables; aquest resultat NO indica absència d'evidència. Torna-ho a provar més tard.",
+    failQuota: "Sense comprovar: s'ha esgotat el límit d'ús de Gemini. Això no vol dir que no n'hi hagi.",
+    quotaOther: "S'HA ESGOTAT EL LÍMIT D'ÚS DE GEMINI (quota). Amb el compte gratuït hi ha molt poques peticions al dia, i es reinicien cap a les 9:00 (hora d'Espanya). L'app ha aturat la cerca per no gastar més. El que ja s'ha comprovat es desa: en prémer «Volver a comprobar» només es repetiran les que han fallat.",
     failedCount: "{f} sense comprovar per error de cerca.",
     claimsReused: "S'han reutilitzat les mateixes afirmacions de l'auditoria anterior perquè els resultats siguin comparables; només s'ha repetit la comprovació de l'evidència.",
     quotaDay: "QUOTA DIÀRIA DE GEMINI ESGOTADA: Google limita les peticions per projecte i per dia, i es reinicia a mitjanit (hora del Pacífic). No s'han gastat més peticions en aquest informe. Torna a auditar després o consulta el panell de límits d'AI Studio.",
@@ -405,6 +451,7 @@ export function buildSummary(args: {
   parts.push(result);
   if (failed > 0) parts.push(fill(t.failNote, { f: failed, n: cv.searched }));
   if (cv.quota === "day") parts.push(t.quotaDay);
+  else if (cv.quota === "other") parts.push(t.quotaOther);
   if (cv.claimsReused) parts.push(t.claimsReused);
 
   const contra = args.checks.filter((c) => c.verdict === "contradicted");
@@ -429,6 +476,8 @@ export async function runClaimAudit(deps: AuditDeps, input: AuditInput, opts: {
     /** Afirmaciones de una auditoría anterior sobre el MISMO texto: se reutilizan en lugar de volver a extraerlas. */
     frozenClaims?: Array<{ claim: string; quote: string; claimType: ClaimType; neutralQuestion: string; importance: number }>;
     frozenExtracted?: number;
+    /** Memoria compartida entre informes: evita repetir búsquedas que ya funcionaron. */
+    evidenceCache?: EvidenceCache;
   } = {}): Promise<AuditOutcome> {
   const hasOriginal = !!input.sourceText && input.sourceText.trim().length >= MIN_SOURCE_TEXT;
   const auditedFrom: AuditOutcome["auditedFrom"] = hasOriginal ? "original_text" : "summary_only";
@@ -449,25 +498,52 @@ export async function runClaimAudit(deps: AuditDeps, input: AuditInput, opts: {
 
   const checkable = considered.filter((c) => c.claimType !== "opinion" && c.claimType !== "prediction");
 
-  // 2) evidencia, con concurrencia acotada y un disyuntor: si la cuota DIARIA está agotada, no se gastan más peticiones
+  // 2) evidencia. Con búsqueda agrupada se gastan muy pocas peticiones (varias afirmaciones por petición), la evidencia
+  //    ya recuperada se reutiliza (memoria de 24 h) y hay un disyuntor: si la cuota se agota, no se gastan más peticiones.
   const evidenceById = new Map<string, Evidence>();
-  let dayQuotaHit: Evidence | null = null;
-  const search = async (c: { neutralQuestion: string; claim: string }): Promise<Evidence> => {
-    if (dayQuotaHit) return { ...dayQuotaHit };
-    const ev = await searchEvidence(deps, c.neutralQuestion || c.claim);
-    if (ev.failed && ev.quota === "day") dayQuotaHit = ev;
-    return ev;
+  const cache = opts.evidenceCache;
+  const keyOf = (c: { neutralQuestion: string; claim: string }) => normalizeForMatch(c.neutralQuestion || c.claim);
+  let quotaHit = null as Evidence | null;
+  const isExhausted = (ev: Evidence) => ev.failed && (ev.quota === "day" || ev.quota === "other");
+  const remember = (c: { id: string; neutralQuestion: string; claim: string }, ev: Evidence) => {
+    evidenceById.set(c.id, ev);
+    if (isExhausted(ev) && !quotaHit) quotaHit = ev;
+    if (!ev.failed && cache) cache.set(keyOf(c), { at: Date.now(), ev });
   };
-  await mapPool(checkable, opts.concurrency ?? AUDIT_CONCURRENCY, async (c) => {
-    evidenceById.set(c.id, await search(c));
-  });
-  // Segunda pasada, en serie y tras una pausa (la que indique Google, hasta 45 s), solo si el fallo no es de cuota diaria.
+  const searchRound = async (list: typeof checkable) => {
+    const todo: typeof checkable = [];
+    for (const c of list) {
+      const hit = cache?.get(keyOf(c));
+      if (hit && Date.now() - hit.at < EVIDENCE_TTL_MS) evidenceById.set(c.id, hit.ev);
+      else todo.push(c);
+    }
+    if (deps.groundedSearchBatch && AUDIT_BATCH_SIZE > 1) {
+      await mapPool(chunkArray(todo, AUDIT_BATCH_SIZE), opts.concurrency ?? AUDIT_CONCURRENCY, async (group) => {
+        if (quotaHit) {
+          for (const c of group) evidenceById.set(c.id, { ...quotaHit });
+          return;
+        }
+        const results = await searchBatch(deps, group);
+        for (const c of group) remember(c, results.get(c.id)!);
+      });
+    } else {
+      await mapPool(todo, opts.concurrency ?? AUDIT_CONCURRENCY, async (c) => {
+        if (quotaHit) {
+          evidenceById.set(c.id, { ...quotaHit });
+          return;
+        }
+        remember(c, await searchEvidence(deps, c.neutralQuestion || c.claim));
+      });
+    }
+  };
+  await searchRound(checkable);
+  // Segunda pasada, tras una pausa (la que indique Google, hasta 45 s), solo si no se ha agotado la cuota.
   const failedFirst = checkable.filter((c) => evidenceById.get(c.id)?.failed);
-  if (failedFirst.length && !dayQuotaHit) {
+  if (failedFirst.length && !quotaHit) {
     const hinted = Math.max(0, ...failedFirst.map((c) => evidenceById.get(c.id)?.retryAfterSec || 0));
     const wait = opts.retryDelayMs === 0 ? 0 : Math.max(opts.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS, Math.min(45, hinted) * 1000);
     await new Promise((r) => setTimeout(r, wait));
-    for (const c of failedFirst) evidenceById.set(c.id, await search(c));
+    await searchRound(failedFirst);
   }
 
   // 3) juicio (una sola llamada) solo para las afirmaciones cuya búsqueda funcionó
@@ -519,7 +595,7 @@ export async function runClaimAudit(deps: AuditDeps, input: AuditInput, opts: {
         ...base,
         verdict: "insufficient_evidence" as ClaimVerdict,
         confidence: 0,
-        explanation: fill(tt.failExplain, { err: ev.error || "error desconocido" }),
+        explanation: ev.quota ? tt.failQuota : fill(tt.failExplain, { err: ev.error || "error desconocido" }),
         evidence: [],
         searchFailed: true,
       };
@@ -549,7 +625,7 @@ export async function runClaimAudit(deps: AuditDeps, input: AuditInput, opts: {
     textTruncated,
     maxClaims: AUDIT_MAX_CLAIMS,
     searchFailed: claimChecks.filter((c) => c.searchFailed).length,
-    quota: dayQuotaHit ? ("day" as const) : undefined,
+    quota: quotaHit ? (quotaHit.quota === "minute" ? ("minute" as const) : quotaHit.quota === "other" ? ("other" as const) : ("day" as const)) : undefined,
     claimsReused: opts.frozenClaims && opts.frozenClaims.length ? true : undefined,
   };
 
