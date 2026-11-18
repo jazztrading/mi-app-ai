@@ -12,6 +12,7 @@ import {
   securityHeaders, ID_RE, validateAnalyzeBody, dailyCostlyCap, dailyCostlyMax, isAuthRequired,
 } from "./server/security";
 import { safeFetch, parseAndValidateUrl, UnsafeUrlError } from "./server/safeFetch";
+import { fetchPage, fetchEpisodeFromFeed, blockedMessage, PageBlockedError, type FeedEpisode } from "./server/pageAccess";
 import {
   makeRegistry, resolveCitations, verifyCitation, scoreReliability, locateFragment,
   type CitationInput, type CitationOutput, type FetchResult, type PageFetcher, type RegistryRecord, type StudyDesign, type SupportVerdict, type VerificationStatus,
@@ -19,7 +20,8 @@ import {
 import { CONTEXT_NOTES, matchContextNotes, renderNotesForPrompt, type ContextNoteView } from "./server/knowledge";
 import nodeCrypto from "node:crypto";
 import { PIPELINE_BASE_VERSION, MIN_FREEZE_CHARS, contentHash, seedFromHash, signAnalysis, findReusable, type FrozenInfo } from "./server/stability";
-import { runClaimAudit, rewriteWithCorrections, parseGeminiError, type AuditDeps, type ClaimCheck, type ClaimVerdict } from "./server/audit";
+import { runClaimAudit, rewriteWithCorrections, parseGeminiError, createEvidenceCache, type AuditDeps, type ClaimCheck, type ClaimVerdict } from "./server/audit";
+import { buildBatchPrompt, parseBatchResponse } from "./server/grounding";
 import {
   findAudioCandidates, isDirectAudioUrl, transcribePodcast, transcribeYouTubeVideo, transcribeImages, mediaNoteFor,
   type TranscriptInfo, type MediaDeps,
@@ -46,7 +48,17 @@ const ai = new GoogleGenAI({
   }
 });
 // Modelos para transcribir audio/vídeo y hacer OCR (mismo orden de respaldo que el resto del pipeline)
-const mediaDeps: MediaDeps = { ai, models: ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"] };
+// Modelos y orden de respaldo. Cada modelo tiene su propia cuota: se pueden cambiar sin tocar el código con
+// GEMINI_MODELS (texto) y GEMINI_SEARCH_MODELS (búsqueda con Google), separados por comas.
+const envList = (name: string, def: string[]) => {
+  const v = (process.env[name] || "").split(",").map((x) => x.trim()).filter(Boolean);
+  return v.length ? v : def;
+};
+const TEXT_MODELS = envList("GEMINI_MODELS", ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"]);
+const SEARCH_MODELS = envList("GEMINI_SEARCH_MODELS", TEXT_MODELS);
+const mediaDeps: MediaDeps = { ai, models: TEXT_MODELS };
+// Memoria de evidencia ya buscada: «Volver a comprobar» no repite las búsquedas que funcionaron.
+const auditEvidenceCache = createEvidenceCache();
 // Tope de caracteres del texto que se envía a analizar (una transcripción de ~2 h cabe de sobra)
 const MAX_MEDIA_TEXT_CHARS = 400_000;
 
@@ -163,7 +175,7 @@ export interface FactCheckAudit {
   auditedFrom?: "original_text" | "summary_only";
   claimChecks?: ClaimCheck[];
   counts?: Record<ClaimVerdict, number>;
-  coverage?: { extracted: number; considered: number; searched: number; notCheckable: number; textTruncated: boolean; maxClaims: number; searchFailed?: number; quota?: "day" | "minute"; claimsReused?: boolean };
+  coverage?: { extracted: number; considered: number; searched: number; notCheckable: number; textTruncated: boolean; maxClaims: number; searchFailed?: number; quota?: "day" | "minute" | "other"; claimsReused?: boolean };
   textHash?: string; // hash del texto auditado: si no cambia, se reutilizan las mismas afirmaciones
   previousExecutiveSummary?: string;
   previousKeyPoints?: string[];
@@ -385,8 +397,8 @@ async function generateAnalysisContentWithRetry(
   preferSearch: boolean = false,
   seed?: number // semilla estable por contenido: mejor esfuerzo, Google no garantiza determinismo
 ): Promise<string> {
-  // Strategy: Try primary gemini-3.8-flash, then fallback to gemini-flash-latest, then gemini-3.1-flash-lite
-  const models = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"];
+  // Strategy: primer modelo de la lista y, si falla, los siguientes (cada uno tiene su propia cuota)
+  const models = TEXT_MODELS;
   let lastError: any = null;
 
   for (const model of models) {
@@ -453,7 +465,7 @@ async function generateTextWithFallback(
   prompt: string,
   systemInstruction: string
 ): Promise<string> {
-  const models = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"];
+  const models = TEXT_MODELS;
   let lastErr: any = null;
 
   for (const model of models) {
@@ -493,7 +505,7 @@ async function generateGroundedSearchText(
   systemInstruction?: string,
   opts?: { strict?: boolean } // strict: sin URLs sacadas del texto del modelo ni respaldo sin búsqueda
 ): Promise<{ text: string; sources: Array<{ title: string; url: string; snippet?: string }>; failed?: boolean; error?: string }> {
-  const models = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"];
+  const models = SEARCH_MODELS;
   let lastErr: any = null;
 
   for (const model of models) {
@@ -569,6 +581,51 @@ async function generateGroundedSearchText(
   } catch (e) {
     throw lastErr || e;
   }
+}
+
+// Búsqueda con Google AGRUPADA: una petición verifica varias afirmaciones (ver server/grounding.ts).
+// Protege la cuota: nunca repite una petición que falló por cuota en el mismo modelo, prueba como mucho una vez por modelo
+// y solo reintenta (una vez, tras la pausa que indique Google) los fallos por límite por minuto o por saturación (503).
+async function generateGroundedSearchBatch(
+  items: Array<{ id: string; question: string }>
+): Promise<{ results: Record<string, { text: string; sources: Array<{ title: string; url: string }> }>; failed?: boolean; error?: string }> {
+  const prompt = buildBatchPrompt(items);
+  let lastErr: any = null;
+  for (const model of SEARCH_MODELS) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        console.log(`[Gemini Grounded Batch] ${items.length} afirmaciones con ${model} (intento ${attempt})...`);
+        const response = await ai.models.generateContent({
+          model,
+          contents: prompt,
+          config: { tools: [{ googleSearch: {} }], temperature: 0.1 },
+        });
+        const text = response.text ? response.text.trim() : "";
+        if (!text) {
+          lastErr = new Error("respuesta vacía del buscador");
+          break;
+        }
+        const gm: any = response.candidates?.[0]?.groundingMetadata;
+        const results = parseBatchResponse(text, items.map((i) => i.id), gm?.groundingChunks, gm?.groundingSupports);
+        return { results };
+      } catch (err: any) {
+        lastErr = err;
+        const info = parseGeminiError(err);
+        console.warn(`[Gemini Grounded Batch] ${model} intento ${attempt} falló (${info.quota || "otro"}): ${String(err?.message || err).slice(0, 200)}`);
+        if (info.quota === "day" || info.quota === "other") break; // la misma cuota no mejora reintentando: se pasa al siguiente modelo
+        const msg = String(err?.message || err);
+        const transient = info.quota === "minute" || /503|UNAVAILABLE|timeout|ECONNRESET|fetch failed/i.test(msg);
+        if (transient && attempt === 1) {
+          await new Promise((r) => setTimeout(r, Math.min(20, info.retryAfterSec || 4) * 1000));
+          continue;
+        }
+        break;
+      }
+    }
+  }
+  const reason = String(lastErr?.message || "respuesta vacía del buscador").slice(0, 4000);
+  console.warn(`[Gemini Grounded Batch] Falló en todos los modelos: ${reason.slice(0, 300)}`);
+  return { results: {}, failed: true, error: reason };
 }
 
 async function startServer() {
@@ -892,7 +949,7 @@ async function startServer() {
             try { fileName = decodeURIComponent(new URL(url).pathname.split("/").pop() || "Audio"); } catch { /* nombre por defecto */ }
             title = fileName;
             const pod = await podcastTranscript([url], fileName);
-            if (!pod.ok) throw new Error(`No se pudo transcribir el audio: ${pod.error}`);
+            if (!pod.ok) throw new HttpError(422, `No se pudo transcribir el audio: ${pod.error}`);
             transcript = pod.text;
             transcriptInfo = pod.info;
             textToAnalyze = `--- TRANSCRIPCIÓN AUTOMÁTICA DEL AUDIO "${fileName}" (IA; con marcas de tiempo [MM:SS]) ---\n${pod.text}\n--- FIN DE LA TRANSCRIPCIÓN ---`;
@@ -937,19 +994,20 @@ async function startServer() {
           }
 
           if (!scraped) {
-            const response = await safeFetch(url, {
-              headers: {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                "Accept-Language": "es-ES,es;q=0.9,en;q=0.8"
+            // Lectura con reintento y detección de bloqueos anti-robot (página de espera, captcha, página vacía).
+            const page = await fetchPage(url);
+            let feedEpisode: FeedEpisode | null = null;
+            if (!page.ok) {
+              console.warn(`[Scrape] ${url}: ${page.blockedReason} (código ${page.status}). Se prueba el feed RSS del podcast.`);
+              feedEpisode = await fetchEpisodeFromFeed(url, page.html);
+              if (!feedEpisode) {
+                const maybePodcast = contentType === "podcast" || /podcast|episod|\/ep-?\d/i.test(url);
+                throw new PageBlockedError(blockedMessage(page.blockedReason || "la web no respondió", page.status, maybePodcast), page.blockedReason || "", page.status);
               }
-            });
-
-            if (!response.ok) {
-              throw new Error(`Error al acceder a la URL (${response.status} ${response.statusText})`);
+              console.log(`[Scrape] Episodio localizado en el feed RSS: ${feedEpisode.title}`);
             }
 
-            const html = await response.text();
+            const html = page.ok ? page.html : "";
             const $ = cheerio.load(html);
 
             // Extract title
@@ -980,6 +1038,11 @@ async function startServer() {
               }
             }
 
+            if (feedEpisode) {
+              title = feedEpisode.title || title;
+              bodyText = feedEpisode.description;
+            }
+
             const ogDesc = $('meta[property="og:description"]').attr('content') || $('meta[name="description"]').attr('content') || "";
             if (ogDesc && !bodyText.includes(ogDesc)) {
               bodyText = `Descripción del artículo: ${ogDesc}\n\n${bodyText}`;
@@ -989,7 +1052,7 @@ async function startServer() {
 
             // Podcast: si la página trae un archivo de audio y su texto es solo la ficha del episodio,
             // el contenido real está en el audio, no en las notas.
-            const audioCandidates = process.env.AUTO_TRANSCRIBE === "false" ? [] : findAudioCandidates(html, response.finalUrl);
+            const audioCandidates = process.env.AUTO_TRANSCRIBE === "false" ? [] : (feedEpisode ? [feedEpisode.audioUrl] : findAudioCandidates(html, page.finalUrl));
             if (audioCandidates.length > 0 && (contentType === "podcast" || bodyText.length < 6000)) {
               effectiveContentType = "podcast";
               const notes = textToAnalyze;
@@ -1003,19 +1066,30 @@ async function startServer() {
                 transcriptInfo = { source: "show-notes", generatedBy: "pagina", complete: false, note: `No se pudo transcribir el audio: ${pod.error}`.slice(0, 500) };
               }
             }
+
+            // Página que responde bien pero sin texto legible y sin audio: no se analiza una URL «a ciegas».
+            if (textToAnalyze.trim().length < 40 && !transcript) {
+              throw new PageBlockedError(blockedMessage("la página no contiene texto legible", page.status, contentType === "podcast"), "página sin texto", page.status);
+            }
           }
         } catch (scrapeErr: any) {
           if (scrapeErr instanceof UnsafeUrlError) throw scrapeErr; // p. ej. redirección a IP privada → 400
-          console.error("Error scraping URL, will rely on prompt context:", scrapeErr);
-          textToAnalyze = `Analiza este ensayo o artículo de internet de la URL: ${url}. Título del recurso: ${title || url}`;
-          textIsFallback = true;
+          // Antes, si fallaba la lectura, se pedía a la IA que «analizara» solo la URL y el título: eso inventaba contenido.
+          // Ahora, si no hay forma de leer el contenido, se dice con claridad (salvo que el usuario haya pegado un texto).
+          const explicit = scrapeErr instanceof HttpError ? scrapeErr.message : `No se pudo abrir la página (${String(scrapeErr?.message || scrapeErr).slice(0, 160)}). Inténtalo otra vez o pega el texto en la pestaña «Pegar texto».`;
+          if (manualText && manualText.trim().length >= 10) {
+            console.warn("Lectura de la URL fallida; se usa el texto pegado por el usuario:", explicit);
+          } else {
+            console.error("Lectura de la URL fallida:", explicit);
+            throw scrapeErr instanceof HttpError ? scrapeErr : new HttpError(422, explicit);
+          }
         }
       }
 
       if (textToAnalyze.length > MAX_MEDIA_TEXT_CHARS) textToAnalyze = textToAnalyze.substring(0, MAX_MEDIA_TEXT_CHARS);
 
       if (contentParts.length === 0 && (!textToAnalyze || textToAnalyze.trim().length < 10)) {
-        return res.status(400).json({ error: "No se pudo sacar suficiente contenido del enlace, del documento o de la imagen para analizarlo." });
+        return res.status(400).json({ error: "No se pudo sacar suficiente texto del enlace, del documento o de la imagen. Prueba a pegar el texto en la pestaña «Pegar texto»." });
       }
 
       const detectedLang = detectLanguage(`${manualText || ""} ${textToAnalyze || ""}`);
@@ -1511,6 +1585,7 @@ ${textToAnalyze}
 
     } catch (err: any) {
       if (err instanceof UnsafeUrlError) return res.status(400).json({ error: err.message });
+      if (err instanceof HttpError) return res.status(err.status).json({ error: err.message });
       console.error("Error durante el análisis:", err);
       let userErrMsg = err.message || "Ha ocurrido un error en el servidor al analizar el contenido.";
       
@@ -1628,6 +1703,7 @@ ${targetText.substring(0, 45000)}`;
       const deps: AuditDeps = {
         llmJson: (prompt, system, schema) => generateAnalysisContentWithRetry(prompt, system, schema, false, seedFromHash(auditHash)),
         groundedSearch: (prompt) => generateGroundedSearchText(prompt, undefined, { strict: true }),
+        groundedSearchBatch: generateGroundedSearchBatch,
       };
 
       const outcome = await runClaimAudit(deps, {
@@ -1640,8 +1716,9 @@ ${targetText.substring(0, 45000)}`;
         ? {
             frozenClaims: prevAudit.claimChecks!.map((c) => ({ claim: c.claim, quote: c.quote, claimType: c.claimType, neutralQuestion: c.neutralQuestion!, importance: c.importance ?? 3 })),
             frozenExtracted: prevAudit.coverage?.extracted,
+            evidenceCache: auditEvidenceCache,
           }
-        : {});
+        : { evidenceCache: auditEvidenceCache });
 
       // Solo se reescribe el resumen con correcciones fuertes (contradichas, confianza >= 0.7, con fuente real).
       // El texto previo se conserva para poder revertir.
