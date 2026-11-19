@@ -152,12 +152,33 @@ const lastSegment = (u: string) => {
   }
 };
 
+/** Minúsculas, sin tildes, «×» como «x» y solo letras/números separados por espacios. */
+export function deburr(s: string): string {
+  return s
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/×/g, "x")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+/** De «…/ep-5x03-la-vivienda-como-problema-filosofico/» saca el código («5x03») y la frase del título. */
+export function episodeKey(pageUrl: string): { code: string; phrase: string; words: number } {
+  const slug = lastSegment(pageUrl).toLowerCase().replace(/^(?:ep(?:isodio)?|e)[-_]?/, "");
+  const m = slug.match(/^(\d+x\d+)[-_]?(.*)$/);
+  const code = m ? m[1] : "";
+  const phrase = deburr(m ? m[2] : slug);
+  return { code, phrase, words: phrase ? phrase.split(" ").length : 0 };
+}
+
 /** Busca en el XML de un feed el episodio que corresponde a la URL de la página. */
 export function findEpisodeInFeed(xml: string, pageUrl: string): FeedEpisode | null {
   if (!/<item[\s>]/i.test(xml)) return null;
   const $ = cheerio.load(xml, { xmlMode: true });
   const wantPath = normUrl(pageUrl);
   const wantSlug = lastSegment(pageUrl).toLowerCase();
+  const key = episodeKey(pageUrl);
   let found: FeedEpisode | null = null;
   $("item").each((_, el) => {
     if (found) return;
@@ -165,7 +186,9 @@ export function findEpisodeInFeed(xml: string, pageUrl: string): FeedEpisode | n
     const link = item.children("link").first().text().trim();
     const guid = item.children("guid").first().text().trim();
     const slugMatch = wantSlug.length > 6 && (lastSegment(link).toLowerCase() === wantSlug || guid.toLowerCase().includes(wantSlug));
-    if (!(normUrl(link) === wantPath || slugMatch)) return;
+    // Los feeds alojados fuera de la web (p. ej. el hosting del podcast) traen otros enlaces: se casa también por el título.
+    const titleMatch = key.words >= 3 && deburr(item.children("title").first().text()).includes(key.phrase);
+    if (!(normUrl(link) === wantPath || slugMatch || titleMatch)) return;
     const audioUrl = (item.children("enclosure").first().attr("url") || "").trim();
     if (!audioUrl) return;
     const raw =
@@ -194,9 +217,99 @@ export async function fetchEpisodeFromFeed(pageUrl: string, html = "", fetcher: 
   return null;
 }
 
+// ───────────────────────── Respaldo: directorio público de podcasts (Apple) ─────────────────────────
+// El feed que el autor publica para Apple Podcasts y Spotify suele alojarse en el servicio de hosting del podcast,
+// no en su web, y es la vía pensada para que lo lean aplicaciones. No se salta ninguna protección: se usa el directorio público.
+
+const hostOf = (u: string) => {
+  try {
+    return new URL(u).hostname.replace(/^www\./, "").toLowerCase();
+  } catch {
+    return "";
+  }
+};
+
+/** Términos de búsqueda para el directorio: el nombre del programa sale del tramo de la URL anterior al episodio. */
+export function directorySearchTerms(pageUrl: string): string[] {
+  let parts: string[] = [];
+  try {
+    parts = new URL(pageUrl).pathname.split("/").filter(Boolean);
+  } catch {
+    return [];
+  }
+  const parent = parts.length >= 2 ? parts[parts.length - 2] : "";
+  const base = deburr(parent.replace(/-/g, " ")).replace(/\bpodcast\b/g, "").replace(/\s+/g, " ").trim();
+  if (!base) return [];
+  return Array.from(new Set([base, `${base} podcast`]));
+}
+
+export function parseDirectoryResults(text: string, term: string): Array<{ feedUrl: string; name: string }> {
+  let data: any;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    return [];
+  }
+  const t = deburr(term);
+  const list: Array<{ feedUrl: string; name: string; score: number }> = [];
+  for (const r of Array.isArray(data?.results) ? data.results : []) {
+    const feedUrl = typeof r?.feedUrl === "string" ? r.feedUrl : "";
+    if (!/^https?:\/\//i.test(feedUrl)) continue;
+    const name = String(r.collectionName || r.trackName || "");
+    list.push({ feedUrl, name, score: deburr(name).includes(t) ? 1 : 0 });
+  }
+  return list.sort((a, b) => b.score - a.score).slice(0, 3).map(({ feedUrl, name }) => ({ feedUrl, name }));
+}
+
+function channelLinkHost(xml: string): string {
+  const $ = cheerio.load(xml, { xmlMode: true });
+  return hostOf($("channel").first().children("link").first().text().trim());
+}
+
+/** Localiza el episodio a través del directorio de Apple Podcasts y el feed que allí figura. */
+export async function fetchEpisodeViaDirectory(pageUrl: string, fetcher: TextFetcher = defaultFetcher): Promise<FeedEpisode | null> {
+  const host = hostOf(pageUrl);
+  const key = episodeKey(pageUrl);
+  for (const term of directorySearchTerms(pageUrl)) {
+    let results: Array<{ feedUrl: string; name: string }> = [];
+    try {
+      const api = `https://itunes.apple.com/search?term=${encodeURIComponent(term)}&media=podcast&entity=podcast&limit=5&country=ES`;
+      const r = await fetcher(api, { Accept: "application/json", "User-Agent": simpleHeaders()["User-Agent"] });
+      if (!r.ok) continue;
+      results = parseDirectoryResults(r.text, term);
+    } catch {
+      continue;
+    }
+    for (const feed of results) {
+      try {
+        const f = await fetcher(feed.feedUrl, browserHeaders(feed.feedUrl));
+        if (!f.ok || !/<item[\s>]/i.test(f.text)) continue;
+        const ep = findEpisodeInFeed(f.text, pageUrl);
+        if (!ep) continue;
+        // Comprobación de identidad: el feed debe ser del mismo programa (su web coincide) o el título debe ser muy específico.
+        const sameShow = channelLinkHost(f.text) === host || hostOf(ep.link) === host;
+        if (sameShow || key.words >= 4) return ep;
+      } catch {
+        /* este feed no responde: se prueba el siguiente */
+      }
+    }
+  }
+  return null;
+}
+
+/** Busca el episodio en los feeds de la propia web y, si no, en el directorio de podcasts. */
+export async function locateEpisode(pageUrl: string, html = "", fetcher: TextFetcher = defaultFetcher): Promise<(FeedEpisode & { via: string }) | null> {
+  const own = await fetchEpisodeFromFeed(pageUrl, html, fetcher);
+  if (own) return { ...own, via: "feed de la propia web" };
+  const dir = await fetchEpisodeViaDirectory(pageUrl, fetcher);
+  if (dir) return { ...dir, via: "directorio de podcasts" };
+  return null;
+}
+
 /** Mensaje claro para el usuario cuando no hay forma de leer la página. */
 export function blockedMessage(reason: string, status: number, looksLikePodcast: boolean): string {
-  const base = `No se pudo leer la página: ${reason}${status ? ` (código ${status})` : ""}. Es la web la que bloquea las lecturas automáticas desde servidores, no un fallo del análisis.`;
+  const shown = /código/i.test(reason) || !status ? reason : `${reason} (código ${status})`;
+  const base = `No se pudo leer la página: ${shown}. La web protege sus páginas contra las lecturas automáticas desde servidores; no es un fallo del análisis.`;
   const options = looksLikePodcast
     ? " Opciones: 1) pega la dirección directa del audio (el enlace «Descarga» del episodio, que acaba en .mp3 o .m4a); 2) pega el texto o las notas en la pestaña «Pegar texto»."
     : " Opciones: pega el texto en la pestaña «Pegar texto» o sube el documento o una captura.";
