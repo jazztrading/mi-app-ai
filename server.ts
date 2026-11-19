@@ -12,7 +12,7 @@ import {
   securityHeaders, ID_RE, validateAnalyzeBody, dailyCostlyCap, dailyCostlyMax, isAuthRequired,
 } from "./server/security";
 import { safeFetch, parseAndValidateUrl, UnsafeUrlError } from "./server/safeFetch";
-import { fetchPage, fetchEpisodeFromFeed, blockedMessage, PageBlockedError, type FeedEpisode } from "./server/pageAccess";
+import { fetchPage, locateEpisode, blockedMessage, PageBlockedError, type FeedEpisode } from "./server/pageAccess";
 import {
   makeRegistry, resolveCitations, verifyCitation, scoreReliability, locateFragment,
   type CitationInput, type CitationOutput, type FetchResult, type PageFetcher, type RegistryRecord, type StudyDesign, type SupportVerdict, type VerificationStatus,
@@ -998,13 +998,14 @@ async function startServer() {
             const page = await fetchPage(url);
             let feedEpisode: FeedEpisode | null = null;
             if (!page.ok) {
-              console.warn(`[Scrape] ${url}: ${page.blockedReason} (código ${page.status}). Se prueba el feed RSS del podcast.`);
-              feedEpisode = await fetchEpisodeFromFeed(url, page.html);
+              console.warn(`[Scrape] ${url}: ${page.blockedReason} (código ${page.status}). Se busca el episodio en los feeds RSS del podcast.`);
+              const located = await locateEpisode(url, page.html);
+              feedEpisode = located;
               if (!feedEpisode) {
                 const maybePodcast = contentType === "podcast" || /podcast|episod|\/ep-?\d/i.test(url);
                 throw new PageBlockedError(blockedMessage(page.blockedReason || "la web no respondió", page.status, maybePodcast), page.blockedReason || "", page.status);
               }
-              console.log(`[Scrape] Episodio localizado en el feed RSS: ${feedEpisode.title}`);
+              console.log(`[Scrape] Episodio localizado (${located?.via}): ${feedEpisode.title}`);
             }
 
             const html = page.ok ? page.html : "";
