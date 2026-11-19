@@ -2,7 +2,13 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   blockedMessage,
+  deburr,
   detectBlock,
+  directorySearchTerms,
+  episodeKey,
+  fetchEpisodeViaDirectory,
+  locateEpisode,
+  parseDirectoryResults,
   feedUrlCandidates,
   fetchEpisodeFromFeed,
   fetchPage,
@@ -118,4 +124,77 @@ test("fetchEpisodeFromFeed: si ningún feed responde, devuelve null", async () =
 test("blockedMessage da opciones concretas según sea o no un podcast", () => {
   assert.match(blockedMessage("la web pide comprobar que no eres un robot", 202, true), /\.m4a|\.mp3/);
   assert.match(blockedMessage("la web respondió con el código 403", 403, false), /Pegar texto/);
+});
+
+// ── Directorio de podcasts (feed alojado fuera de la web) ──
+const CASTOS_FEED = `<?xml version="1.0"?><rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd"><channel>
+<title>El Panóptico</title><link>https://www.joseantoniomarina.net/el-panoptico-podcast/</link>
+<item><title>Ep. 5×04: Otro tema</title><link>https://feeds.example.org/e/otro</link><enclosure url="https://cdn.example.org/otro.mp3" type="audio/mpeg"/></item>
+<item><title>Ep. 5×03: La vivienda como problema filosófico</title><link>https://feeds.example.org/e/abc123</link>
+<description>Notas del episodio.</description><enclosure url="${M4A}" type="audio/mp4"/></item></channel></rss>`;
+const ITUNES = JSON.stringify({ resultCount: 2, results: [
+  { collectionName: "Otro programa distinto", feedUrl: "https://feeds.example.org/otro-show" },
+  { collectionName: "El Panóptico", feedUrl: "https://feeds.example.org/panoptico" },
+] });
+
+test("deburr y episodeKey: sacan el código y la frase del título de la URL (×, tildes, mayúsculas)", () => {
+  assert.equal(deburr("Ep. 5×03: La vivienda como problema filosófico"), "ep 5x03 la vivienda como problema filosofico");
+  const k = episodeKey(EP);
+  assert.equal(k.code, "5x03");
+  assert.equal(k.phrase, "la vivienda como problema filosofico");
+  assert.equal(k.words, 5);
+});
+
+test("directorySearchTerms toma el nombre del programa del tramo anterior al episodio", () => {
+  assert.deepEqual(directorySearchTerms(EP), ["el panoptico", "el panoptico podcast"]);
+  assert.deepEqual(directorySearchTerms("https://x.org/episodio-unico"), []);
+});
+
+test("parseDirectoryResults ordena primero el programa cuyo nombre coincide y descarta resultados sin feed", () => {
+  const r = parseDirectoryResults(ITUNES, "el panoptico");
+  assert.equal(r[0].feedUrl, "https://feeds.example.org/panoptico");
+  assert.deepEqual(parseDirectoryResults("no es json", "x"), []);
+  assert.deepEqual(parseDirectoryResults(JSON.stringify({ results: [{ collectionName: "A" }] }), "a"), []);
+});
+
+test("fetchEpisodeViaDirectory: encuentra el episodio en un feed alojado fuera de la web aunque la web esté bloqueada", async () => {
+  const f: TextFetcher = async (url) => {
+    if (url.startsWith("https://itunes.apple.com/search")) return { status: 200, ok: true, text: ITUNES, finalUrl: url };
+    if (url === "https://feeds.example.org/panoptico") return { status: 200, ok: true, text: CASTOS_FEED, finalUrl: url };
+    return { status: 202, ok: true, text: SG_CAPTCHA, finalUrl: url };
+  };
+  const ep = await fetchEpisodeViaDirectory(EP, f);
+  assert.ok(ep);
+  assert.equal(ep!.audioUrl, M4A);
+  assert.match(ep!.title, /vivienda/);
+});
+
+test("fetchEpisodeViaDirectory: rechaza el feed de otro programa cuando el título es corto y la web no coincide", async () => {
+  const otro = CASTOS_FEED.replace("https://www.joseantoniomarina.net/el-panoptico-podcast/", "https://otraweb.example.com/").replace("La vivienda como problema filosófico", "Casa y hogar");
+  const f: TextFetcher = async (url) => {
+    if (url.startsWith("https://itunes.apple.com/search")) return { status: 200, ok: true, text: ITUNES, finalUrl: url };
+    return { status: 200, ok: true, text: otro, finalUrl: url };
+  };
+  assert.equal(await fetchEpisodeViaDirectory("https://www.joseantoniomarina.net/el-panoptico-podcast/ep-5x03-casa-hogar/", f), null);
+});
+
+test("locateEpisode: usa el feed de la web si funciona y, si no, el directorio; indica por dónde lo encontró", async () => {
+  const soloDirectorio: TextFetcher = async (url) => {
+    if (url.startsWith("https://itunes.apple.com/search")) return { status: 200, ok: true, text: ITUNES, finalUrl: url };
+    if (url === "https://feeds.example.org/panoptico") return { status: 200, ok: true, text: CASTOS_FEED, finalUrl: url };
+    return { status: 403, ok: false, text: "Forbidden", finalUrl: url };
+  };
+  const a = await locateEpisode(EP, "", soloDirectorio);
+  assert.equal(a?.via, "directorio de podcasts");
+  const feedPropio: TextFetcher = async (url) => (url.endsWith("/feed/podcast/") ? { status: 200, ok: true, text: FEED, finalUrl: url } : { status: 403, ok: false, text: "", finalUrl: url });
+  const b = await locateEpisode(EP, "", feedPropio);
+  assert.equal(b?.via, "feed de la propia web");
+  const nada: TextFetcher = async (url) => ({ status: 403, ok: false, text: "", finalUrl: url });
+  assert.equal(await locateEpisode(EP, "", nada), null);
+});
+
+test("blockedMessage no repite el código de estado", () => {
+  const m = blockedMessage("la web devolvió una página de espera (código 202)", 202, true);
+  assert.equal((m.match(/código 202/g) || []).length, 1);
+  assert.match(blockedMessage("la web pide comprobar que no eres un robot", 202, true), /código 202/);
 });
